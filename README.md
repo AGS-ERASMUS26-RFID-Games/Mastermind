@@ -240,4 +240,4 @@ The RAM figure reported by the Arduino IDE is lower because it does not yet
 include the matrix buffer – that is only allocated at runtime.
 
 ## 5. Wiring
-![schematic for the Wiring of the electronic parts](mastermind_kicad\images\mastermind_schematic.png)
+![schematic for the Wiring of the electronic parts](/mastermind_kicad/images/mastermind_schematic.png)
