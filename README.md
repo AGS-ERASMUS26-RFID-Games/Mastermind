@@ -389,7 +389,7 @@ at runtime.
 The complete schematic is in `mastermind.kicad_sch`. In the sketch, the pins
 are defined at the top under *Pins*.
 
-![Schematic – Arduino Mega 2560 version](/kicad/mastermind_schematic.png)
+![Schematic – Arduino Mega 2560 version](/mastermind_kicad/mastermind_schematic.png)
 
 ### Pin assignment
 
