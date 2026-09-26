@@ -36,14 +36,16 @@
        0 = White (no / unknown chip)
        1 = Red,  2 = Green,  3 = Blue,  4 = Yellow
 
-   WIRING (Arduino UNO)
-     Shared across all 4 readers:
-       SCK   -> Pin 13
-       MOSI  -> Pin 11
-       MISO  -> Pin 12
+   WIRING (Arduino Mega 2560)
+     Shared across all 4 readers (hardware SPI of the Mega):
+       SCK   -> Pin 52
+       MOSI  -> Pin 51
+       MISO  -> Pin 50
        RST   -> Pin 9
        3.3V  -> 3.3V     (NOT 5V!)
        GND   -> GND
+       SCK/MOSI/MISO are also available on the 6-pin ICSP header.
+       Pins 11/12/13 are NOT connected to SPI on the Mega!
      Individually per reader:
        SDA/SS reader 1 -> Pin 10
        SDA/SS reader 2 -> Pin 8
@@ -51,10 +53,20 @@
        SDA/SS reader 4 -> Pin 6
      LED matrix:
        DIN   -> Pin 5
-     Button:
+     Button (confirm):
        one contact -> Pin 2, other contact -> GND
        (internal pullup, pressed = LOW)
+     Reserved (in the schematic, not used by this firmware):
+       Button 2 -> Pin 3, Button 3 -> Pin 18 (both interrupt-capable)
+     Pin 53 (hardware SS) stays unconnected. It must remain an OUTPUT so
+     the Mega stays SPI master - SPI.begin() takes care of that.
    ========================================================================= */
+
+// This sketch and its pin assignment are made for the Mega 2560.
+// Select "Arduino Mega or Mega 2560" under Tools > Board.
+#if !defined(__AVR_ATmega2560__)
+#error "Wrong board selected: this sketch is wired for the Arduino Mega 2560."
+#endif
 
 #include <SPI.h>
 #include <MFRC522.h>
@@ -89,8 +101,11 @@ const byte         DEBOUNCE_TIME      = 30;    // button debounce
 
 // --------------------------------- Pins ----------------------------------
 
+// Hardware SPI of the Mega (fixed, set up by SPI.begin(), listed here
+// only for reference): MISO = 50, MOSI = 51, SCK = 52, SS = 53.
+
 const byte MATRIX_PIN = 5;
-const byte BUTTON_PIN = 2;   // Pin 2 = interrupt 0 on the UNO
+const byte BUTTON_PIN = 2;   // interrupt-capable on the Mega (D2, D3, D18-D21)
 
 const byte READER_COUNT = 4;   // = length of the color sequence
 
@@ -114,6 +129,46 @@ const unsigned int POLL_INTERVAL = 30;
 // Wait time after switching on an antenna (ms).
 // If chips are detected unreliably: increase this first (e.g. to 10).
 const byte ANTENNA_WAIT = 5;
+
+// Receiver gain of all 4 readers (step 0..5). Lower = shorter range.
+// The RC522 only knows these 6 values, there are no steps in between:
+//   step:   0      1      2      3      4      5
+//   gain:  18 dB  23 dB  33 dB  38 dB  43 dB  48 dB
+//                        ^ library default after PCD_Init()
+const byte RFID_GAIN_STEP = 2;
+
+// Transmitter power of all 4 readers (step 1..8), i.e. the strength of the
+// field itself. Step 8 = library default (full power).
+// The library has no function for this, so the driver conductance registers
+// are written directly: CWGsP = step * 4, CWGsN = step
+// (step 8 -> 0x20 / 0x8 = reset values, step 4 -> 0x10 / 0x4, ...).
+// The field does not drop linearly: neighboring steps may hardly differ,
+// below a certain step detection stops abruptly.
+const byte TX_POWER_STEP = 4;
+
+// Both values can also be changed at runtime via the Serial Monitor
+// (DEBUG 1): "g0".."g5" = gain, "t1".."t8" = transmitter power,
+// "?" = show current settings. Enter the values found afterwards here.
+
+const byte GAIN_STEP_COUNT = 6;
+const byte TX_STEP_MAX     = 8;
+static_assert(RFID_GAIN_STEP < GAIN_STEP_COUNT, "RFID_GAIN_STEP must be 0..5");
+static_assert(TX_POWER_STEP >= 1 && TX_POWER_STEP <= TX_STEP_MAX,
+              "TX_POWER_STEP must be 1..8");
+
+// Chip lock against cross-reading (see documentation, "Chip lock").
+// true  = every chip is assigned to exactly one reader, even if several
+//         readers see it. Costs a little time per polling round.
+// false = every reader simply shows the first chip it sees (old behavior).
+const bool CHIP_LOCK = true;
+
+// Max. number of chips read per reader and round
+// (its own chip + chips of neighbors that reach into its field)
+const byte MAX_CHIPS_PER_READER = 3;
+
+// How long a decision of the power test stays valid (ms).
+// Before a button confirmation the test is always repeated.
+const unsigned int PROBE_CACHE_TIME = 3000;
 
 // ------------------------------ Layout -----------------------------------
 
@@ -148,7 +203,7 @@ byte colors[COLOR_COUNT][3] =
 const byte OFF[3] = { 0, 0, 0 };
 
 // ------------------------------ Texts ------------------------------------
-// Texts on the matrix. Stored in flash (PROGMEM), not in the scarce RAM.
+// Texts on the matrix. Stored in flash (PROGMEM) instead of RAM.
 
 const char TEXT_START[] PROGMEM = "MASTERMIND - PRESS BUTTON";
 const char TEXT_WIN[]   PROGMEM = "YOU WIN!";
@@ -236,10 +291,31 @@ bool endImageActive = false;
 unsigned long endImageSince = 0;
 
 // Reader
+byte gainStep = RFID_GAIN_STEP;   // current settings (changeable via serial)
+byte txStep   = TX_POWER_STEP;
 byte readerColor[READER_COUNT];             // color index per reader
 byte currentUid[READER_COUNT][UID_LENGTH];  // UID of the chip currently present
 bool chipPresent[READER_COUNT];             // is a chip currently present?
 byte failedReads[READER_COUNT];             // counter for dropouts
+
+// Chip lock
+const byte NO_READER    = 0xFF;
+const byte NO_THRESHOLD = 0xFF;
+const byte MAX_UIDS     = READER_COUNT * MAX_CHIPS_PER_READER;
+
+// All chips each reader saw in the current polling round
+byte seenCount[READER_COUNT];
+byte seenUid[READER_COUNT][MAX_CHIPS_PER_READER][UID_LENGTH];
+
+// Remembered results of the power test (one entry per contested chip)
+struct ProbeResult {
+  byte uid[UID_LENGTH];
+  byte mask;              // readers that competed (bit 0 = reader 1)
+  byte winner;            // reader index or NO_READER (tie)
+  unsigned long time;     // millis() of the test
+  bool valid;
+};
+ProbeResult probeCache[READER_COUNT];
 
 // Button (written inside the interrupt -> volatile)
 volatile bool buttonPressed = false;
@@ -249,7 +325,7 @@ unsigned long buttonTime = 0;               // copy for the main program
 
 // ============================== Button ===================================
 
-// Interrupt on every level change at pin 2.
+// Interrupt on every level change at the button pin (pin 2).
 // A press only counts if the pin is LOW and the last edge is longer ago
 // than DEBOUNCE_TIME. The bouncing on press AND on release produces edges
 // in quick succession and is thereby ignored.
@@ -327,31 +403,73 @@ bool scrollTextStep(const char* text, const byte* color) {
 
 // ============================== RFID =====================================
 
-// Polls one reader. Returns true if a chip is in the field,
-// and writes its UID into uidTarget.
+// Polls one reader and reads ALL chips in its field (up to
+// MAX_CHIPS_PER_READER), so that its own chip is found even if a
+// neighbor's chip also reaches into the field. Writes the UIDs into
+// uids[] and returns how many were found.
+// Procedure: WUPA wakes all chips, one of them is selected (anticollision),
+// read and put to sleep (HALT). REQA then only wakes chips that are not yet
+// asleep - so the next chip answers, until none is left.
 // Only the antenna of the reader being polled is on at any time.
-bool readChip(MFRC522 &r, byte* uidTarget) {
-  bool found = false;
+byte readAllChips(MFRC522 &r, byte uids[][UID_LENGTH]) {
+  byte count = 0;
+  byte maxChips = CHIP_LOCK ? MAX_CHIPS_PER_READER : 1;
 
   r.PCD_AntennaOn();
   delay(ANTENNA_WAIT);
 
-  byte atqa[2];
-  byte atqaSize = sizeof(atqa);
+  for (byte n = 0; n < maxChips; n++) {
+    byte atqa[2];
+    byte atqaSize = sizeof(atqa);
 
-  // WUPA wakes chips from both IDLE and HALT
-  MFRC522::StatusCode status = r.PICC_WakeupA(atqa, &atqaSize);
+    MFRC522::StatusCode status = (n == 0)
+      ? r.PICC_WakeupA(atqa, &atqaSize)     // first chip: wake everything
+      : r.PICC_RequestA(atqa, &atqaSize);   // further chips: only those not asleep
 
-  if (status == MFRC522::STATUS_OK || status == MFRC522::STATUS_COLLISION) {
-    if (r.PICC_ReadCardSerial()) {
-      memcpy(uidTarget, r.uid.uidByte, UID_LENGTH);
-      found = true;
+    if (status != MFRC522::STATUS_OK && status != MFRC522::STATUS_COLLISION) break;
+    if (!r.PICC_ReadCardSerial()) break;
+
+    bool duplicate = false;
+    for (byte k = 0; k < count; k++) {
+      if (memcmp(uids[k], r.uid.uidByte, UID_LENGTH) == 0) duplicate = true;
     }
+    if (!duplicate) {
+      memcpy(uids[count], r.uid.uidByte, UID_LENGTH);
+      count++;
+    }
+
     r.PICC_HaltA();
+    if (duplicate) break;   // chip did not go to sleep -> stop, no endless loop
   }
 
   r.PCD_AntennaOff();
-  return found;
+  return count;
+}
+
+// Sets the transmitter power (step 1..8) of one reader.
+// Only the "no modulation" values are changed; ModGsP has no effect anyway
+// (the library forces 100 % ASK), and the lower 4 bits of GsNReg (ModGsN)
+// are kept as they are.
+void setTxPower(byte i, byte step) {
+  reader[i].PCD_WriteRegister(MFRC522::CWGsPReg, step * 4);
+  byte gsn = reader[i].PCD_ReadRegister(MFRC522::GsNReg);
+  reader[i].PCD_WriteRegister(MFRC522::GsNReg, (step << 4) | (gsn & 0x0F));
+}
+
+// Register values for the gain steps 0..5
+const byte GAIN_VALUES[GAIN_STEP_COUNT] = {
+  MFRC522::RxGain_18dB, MFRC522::RxGain_23dB, MFRC522::RxGain_33dB,
+  MFRC522::RxGain_38dB, MFRC522::RxGain_43dB, MFRC522::RxGain_48dB
+};
+
+// Writes gain and transmitter power (gainStep / txStep) to all readers.
+// Must be called after PCD_Init(), because PCD_Init() resets both.
+void applyRfidSettings() {
+  for (byte i = 0; i < READER_COUNT; i++) {
+    reader[i].PCD_SetAntennaGain(GAIN_VALUES[gainStep]);
+    setTxPower(i, txStep);
+    probeCache[i].valid = false;   // old power-test results no longer apply
+  }
 }
 
 // Looks up the color index for a UID. Unknown chip -> 0 (White)
@@ -377,6 +495,27 @@ const char* const COLOR_NAMES[COLOR_COUNT] = {
   "White", "Red", "Green", "Blue", "Yellow"
 };
 
+// Prints a UID in hex, e.g. "04 34 13 BB"
+void printUid(const byte* uid) {
+  for (byte i = 0; i < UID_LENGTH; i++) {
+    if (uid[i] < 0x10) Serial.print('0');
+    Serial.print(uid[i], HEX);
+    if (i < UID_LENGTH - 1) Serial.print(' ');
+  }
+}
+
+// Prints the readers of a bit mask, e.g. "1+2"
+void printReaders(byte mask) {
+  bool first = true;
+  for (byte i = 0; i < READER_COUNT; i++) {
+    if (mask & (1 << i)) {
+      if (!first) Serial.print('+');
+      Serial.print(i + 1);
+      first = false;
+    }
+  }
+}
+
 // Serial output of a reader. uid == NULL -> no chip
 void report(byte index, const byte* uid) {
   Serial.print(F("Reader "));
@@ -396,11 +535,7 @@ void report(byte index, const byte* uid) {
       if (i < UID_LENGTH - 1) Serial.print(' ');
     }
     Serial.print(F(" | hex: "));
-    for (byte i = 0; i < UID_LENGTH; i++) {
-      if (uid[i] < 0x10) Serial.print('0');
-      Serial.print(uid[i], HEX);
-      if (i < UID_LENGTH - 1) Serial.print(' ');
-    }
+    printUid(uid);
     Serial.print(']');
   } else {
     Serial.print(F("   [no chip]"));
@@ -413,6 +548,63 @@ void reportSequence(const byte* sequence) {
   for (byte i = 0; i < READER_COUNT; i++) {
     Serial.print(COLOR_NAMES[sequence[i]]);
     Serial.print(' ');
+  }
+}
+
+const byte GAIN_DB[GAIN_STEP_COUNT] = { 18, 23, 33, 38, 43, 48 };
+
+// Prints the current RFID settings, read back from every reader
+void reportRfidSettings() {
+  Serial.print(F("RFID: gain step "));
+  Serial.print(gainStep);
+  Serial.print(F(" ("));
+  Serial.print(GAIN_DB[gainStep]);
+  Serial.print(F(" dB), transmitter power step "));
+  Serial.print(txStep);
+  Serial.println(F(" of 8"));
+
+  // Expected: gain 0x00/0x10/0x40/0x50/0x60/0x70, CWGsP = step*4, GsN = step in the upper digit
+  for (byte i = 0; i < READER_COUNT; i++) {
+    Serial.print(F("  Reader "));
+    Serial.print(i + 1);
+    Serial.print(F(": gain 0x"));
+    Serial.print(reader[i].PCD_GetAntennaGain(), HEX);
+    Serial.print(F(" | CWGsP 0x"));
+    Serial.print(reader[i].PCD_ReadRegister(MFRC522::CWGsPReg), HEX);
+    Serial.print(F(" | GsN 0x"));
+    Serial.println(reader[i].PCD_ReadRegister(MFRC522::GsNReg), HEX);
+  }
+}
+
+// Change gain / transmitter power at runtime via the Serial Monitor:
+//   g0..g5 = gain step, t1..t8 = transmitter power step, ? = show settings
+void serialTuning() {
+  static char command = 0;
+
+  while (Serial.available()) {
+    char c = Serial.read();
+
+    if (c == 'g' || c == 'G' || c == 't' || c == 'T') {
+      command = tolower(c);
+    } else if (c == '?') {
+      reportRfidSettings();
+      command = 0;
+    } else if (c >= '0' && c <= '9' && command != 0) {
+      byte value = c - '0';
+      if (command == 'g' && value < GAIN_STEP_COUNT) {
+        gainStep = value;
+        applyRfidSettings();
+        reportRfidSettings();
+      } else if (command == 't' && value >= 1 && value <= TX_STEP_MAX) {
+        txStep = value;
+        applyRfidSettings();
+        reportRfidSettings();
+      } else {
+        Serial.println(F("Invalid value (g0..g5, t1..t8)"));
+      }
+      command = 0;
+    }
+    // everything else (line endings etc.) is ignored
   }
 }
 
@@ -474,16 +666,317 @@ void checkTable() {
 }
 #endif
 
-// Polls reader i and updates readerColor[i].
-// Returns true if the displayed color has changed.
-bool checkReader(byte i) {
-  byte uid[UID_LENGTH];
+// ============================ Chip lock ==================================
+//
+// Every polling round runs in three steps (pollReaders):
+//   1. Read:    every reader reads ALL chips in its field.
+//   2. Assign:  every chip is assigned to at most one reader (resolveOwners).
+//   3. Update:  the display state of every reader is updated (updateReader).
+//
+// Assignment rules, applied repeatedly until everything is decided:
+//   a) Elimination: if only one free reader is left for a chip, the chip
+//      belongs to it. The reader is then taken. Example: reader 1 sees A+B,
+//      reader 2 sees B -> A only fits reader 1, so B belongs to reader 2.
+//   b) A chip for which all its readers are taken belongs to nobody
+//      (it was only cross-read).
+//   c) If a chip is still seen by several free readers, the power test
+//      decides: the transmitter power is lowered step by step; the reader
+//      that still sees the chip at the lowest step is closest to it.
+//   d) If several chips can only belong to the same reader, it keeps the
+//      chip it already shows; otherwise the power test decides here too.
+//   Tie -> the chip belongs to nobody. In case of doubt the reader therefore
+//   shows white: the row does not blink and cannot be confirmed.
+// The reader that currently shows a chip counts as a candidate for it even
+// if it missed it in this round (dropout) - so a single dropout does not
+// hand the chip over to a neighbor.
 
-  if (readChip(reader[i], uid)) {
+void blinkTick();   // defined in the game logic
+
+// Pointer to the UID behind a list reference (reader * MAX + index)
+const byte* seenUidAt(byte ref) {
+  return seenUid[ref / MAX_CHIPS_PER_READER][ref % MAX_CHIPS_PER_READER];
+}
+
+// Did reader i see this UID in the current round?
+bool sawUid(byte i, const byte* uid) {
+  for (byte k = 0; k < seenCount[i]; k++) {
+    if (memcmp(seenUid[i][k], uid, UID_LENGTH) == 0) return true;
+  }
+  return false;
+}
+
+// Does reader i see the UID at transmitter power step "step"?
+bool seesUidAt(byte i, const byte* uid, byte step) {
+  byte uids[MAX_CHIPS_PER_READER][UID_LENGTH];
+  setTxPower(i, step);
+  byte count = readAllChips(reader[i], uids);
+  for (byte k = 0; k < count; k++) {
+    if (memcmp(uids[k], uid, UID_LENGTH) == 0) return true;
+  }
+  return false;
+}
+
+// Power test: lowest transmitter power step at which reader i still sees
+// the chip (binary search, 3-4 reads). NO_THRESHOLD = not seen at all.
+byte probeThreshold(byte i, const byte* uid) {
+  byte result = NO_THRESHOLD;
+
+  if (seesUidAt(i, uid, txStep)) {
+    byte low = 1, high = txStep;
+    while (low < high) {
+      byte middle = (low + high) / 2;
+      blinkTick();
+      if (seesUidAt(i, uid, middle)) high = middle;
+      else                           low  = middle + 1;
+    }
+    result = low;
+  }
+
+  setTxPower(i, txStep);   // back to normal power
+  return result;
+}
+
+// Chip seen by several readers (mask): the reader with the lowest power
+// step wins. Tie or not seen by anyone -> NO_READER.
+// Results are remembered for PROBE_CACHE_TIME, unless fresh == true.
+byte decideContested(const byte* uid, byte mask, bool fresh) {
+  // Remembered result?
+  if (!fresh) {
+    for (byte c = 0; c < READER_COUNT; c++) {
+      ProbeResult &p = probeCache[c];
+      if (p.valid && p.mask == mask &&
+          millis() - p.time < PROBE_CACHE_TIME &&
+          memcmp(p.uid, uid, UID_LENGTH) == 0) {
+        return p.winner;
+      }
+    }
+  }
+
+#if DEBUG
+  Serial.print(F("Chip "));
+  printUid(uid);
+  Serial.print(F(" seen by readers "));
+  printReaders(mask);
+  Serial.print(F(" -> power test:"));
+#endif
+
+  byte best = NO_THRESHOLD;
+  byte winner = NO_READER;
+  bool tie = false;
+
+  for (byte i = 0; i < READER_COUNT; i++) {
+    if (!(mask & (1 << i))) continue;
+    byte t = probeThreshold(i, uid);
+#if DEBUG
+    Serial.print(F(" R"));
+    Serial.print(i + 1);
+    Serial.print('=');
+    if (t == NO_THRESHOLD) Serial.print('-');
+    else                   Serial.print(t);
+#endif
+    if (t < best) {
+      best = t;
+      winner = i;
+      tie = false;
+    } else if (t == best && t != NO_THRESHOLD) {
+      tie = true;
+    }
+  }
+  if (tie) winner = NO_READER;
+
+#if DEBUG
+  if (winner == NO_READER) {
+    Serial.println(F(" -> undecided, nobody"));
+  } else {
+    Serial.print(F(" -> reader "));
+    Serial.println(winner + 1);
+  }
+#endif
+
+  // Remember: slot with the same UID, otherwise a free or the oldest one
+  byte slot = 0;
+  for (byte c = 0; c < READER_COUNT; c++) {
+    if (probeCache[c].valid && memcmp(probeCache[c].uid, uid, UID_LENGTH) == 0) {
+      slot = c;
+      break;
+    }
+    if (!probeCache[c].valid ||
+        (probeCache[slot].valid && probeCache[c].time < probeCache[slot].time)) {
+      slot = c;
+    }
+  }
+  memcpy(probeCache[slot].uid, uid, UID_LENGTH);
+  probeCache[slot].mask   = mask;
+  probeCache[slot].winner = winner;
+  probeCache[slot].time   = millis();
+  probeCache[slot].valid  = true;
+
+  return winner;
+}
+
+// Several chips can only belong to reader r (forced = list of list
+// indices). Returns the list index of the winner or NO_READER.
+byte decideOnReader(byte r, const byte* listRef, const byte* forced,
+                    byte forcedCount, bool fresh) {
+  // It keeps the chip it already shows (not for the fresh check)
+  if (!fresh && chipPresent[r]) {
+    for (byte f = 0; f < forcedCount; f++) {
+      if (memcmp(seenUidAt(listRef[forced[f]]), currentUid[r], UID_LENGTH) == 0) {
+        return forced[f];
+      }
+    }
+  }
+
+#if DEBUG
+  Serial.print(F("Reader "));
+  Serial.print(r + 1);
+  Serial.print(F(" sees "));
+  Serial.print(forcedCount);
+  Serial.print(F(" chips -> power test:"));
+#endif
+
+  byte best = NO_THRESHOLD;
+  byte winner = NO_READER;
+  bool tie = false;
+
+  for (byte f = 0; f < forcedCount; f++) {
+    byte t = probeThreshold(r, seenUidAt(listRef[forced[f]]));
+#if DEBUG
+    Serial.print(' ');
+    if (t == NO_THRESHOLD) Serial.print('-');
+    else                   Serial.print(t);
+#endif
+    if (t < best) {
+      best = t;
+      winner = forced[f];
+      tie = false;
+    } else if (t == best && t != NO_THRESHOLD) {
+      tie = true;
+    }
+  }
+  if (tie) winner = NO_READER;
+
+#if DEBUG
+  if (winner == NO_READER) {
+    Serial.println(F(" -> undecided, white"));
+  } else {
+    Serial.print(F(" -> keeps "));
+    printUid(seenUidAt(listRef[winner]));
+    Serial.println();
+  }
+#endif
+  return winner;
+}
+
+// Assigns every chip seen in this round to at most one reader.
+// owner[i] = UID assigned to reader i, or NULL.
+void resolveOwners(const byte* owner[], bool fresh) {
+  byte listRef[MAX_UIDS];   // where the UID bytes are (see seenUidAt)
+  byte cand[MAX_UIDS];      // candidate readers as bit mask; 0 = decided
+  byte listCount = 0;
+
+  // Collect all different UIDs and which readers saw them
+  for (byte i = 0; i < READER_COUNT; i++) {
+    for (byte k = 0; k < seenCount[i]; k++) {
+      byte j = 0;
+      while (j < listCount &&
+             memcmp(seenUidAt(listRef[j]), seenUid[i][k], UID_LENGTH) != 0) j++;
+      if (j == listCount) {
+        listRef[listCount] = i * MAX_CHIPS_PER_READER + k;
+        cand[listCount] = 0;
+        listCount++;
+      }
+      cand[j] |= (1 << i);
+    }
+  }
+
+  // The reader currently showing a chip remains a candidate for it
+  for (byte i = 0; i < READER_COUNT; i++) {
+    if (!chipPresent[i]) continue;
+    for (byte j = 0; j < listCount; j++) {
+      if (memcmp(seenUidAt(listRef[j]), currentUid[i], UID_LENGTH) == 0) {
+        cand[j] |= (1 << i);
+      }
+    }
+  }
+
+  for (byte i = 0; i < READER_COUNT; i++) owner[i] = NULL;
+  byte taken = 0;   // readers that are decided
+
+  while (true) {
+    bool progress = false;
+
+    // b) all candidates taken -> the chip belongs to nobody
+    for (byte j = 0; j < listCount; j++) {
+      if (cand[j] != 0 && (cand[j] & ~taken) == 0) {
+        cand[j] = 0;
+        progress = true;
+      }
+    }
+
+    // a) + d) readers that are the last free candidate for some chips
+    for (byte r = 0; r < READER_COUNT; r++) {
+      if (taken & (1 << r)) continue;
+
+      byte forced[MAX_UIDS];
+      byte forcedCount = 0;
+      for (byte j = 0; j < listCount; j++) {
+        if (cand[j] != 0 && (cand[j] & ~taken) == (1 << r)) {
+          forced[forcedCount++] = j;
+        }
+      }
+      if (forcedCount == 0) continue;
+
+      byte winner = (forcedCount == 1)
+        ? forced[0]
+        : decideOnReader(r, listRef, forced, forcedCount, fresh);
+
+      taken |= (1 << r);
+      if (winner != NO_READER) {
+        owner[r] = seenUidAt(listRef[winner]);
+        cand[winner] = 0;
+      }
+      progress = true;
+    }
+
+    if (progress) continue;
+
+    // c) a chip with several free candidates -> power test
+    byte j = 0;
+    while (j < listCount && cand[j] == 0) j++;
+    if (j == listCount) break;   // everything decided
+
+    byte mask = cand[j] & ~taken;
+    byte winner = decideContested(seenUidAt(listRef[j]), mask, fresh);
+    cand[j] = 0;
+    if (winner != NO_READER) {
+      owner[winner] = seenUidAt(listRef[j]);
+      taken |= (1 << winner);
+    }
+  }
+}
+
+// Removes the chip of reader i from the display at once
+bool removeChip(byte i) {
+  chipPresent[i] = false;
+  failedReads[i] = 0;
+  bool changed   = (readerColor[i] != COLOR_WHITE);
+  readerColor[i] = COLOR_WHITE;
+#if DEBUG
+  report(i, NULL);
+#endif
+  return changed;
+}
+
+// Updates the state of reader i. uid = chip assigned to it and actually
+// seen in this round, NULL = none.
+// Returns true if the displayed color has changed.
+bool updateReader(byte i, const byte* uid) {
+  if (uid != NULL) {
     // --- A chip is present ---
     failedReads[i] = 0;
 
-    bool isNew     = !chipPresent[i];
+    bool isNew      = !chipPresent[i];
     bool hasSwapped = chipPresent[i] &&
                       memcmp(uid, currentUid[i], UID_LENGTH) != 0;
 
@@ -502,19 +995,56 @@ bool checkReader(byte i) {
   } else if (chipPresent[i]) {
     // --- No response, although a chip was present before ---
     failedReads[i]++;
-
-    if (failedReads[i] >= MAX_FAILED_READS) {
-      chipPresent[i] = false;
-      failedReads[i] = 0;
-      bool changed   = (readerColor[i] != COLOR_WHITE);
-      readerColor[i] = COLOR_WHITE;
-#if DEBUG
-      report(i, NULL);
-#endif
-      return changed;
-    }
+    if (failedReads[i] >= MAX_FAILED_READS) return removeChip(i);
   }
   return false;
+}
+
+// One complete polling round over all readers.
+// fresh = true: ignore remembered power-test results (before confirming).
+// Returns true if a displayed color has changed.
+bool pollReaders(bool fresh) {
+  // 1. Read
+  for (byte i = 0; i < READER_COUNT; i++) {
+    seenCount[i] = readAllChips(reader[i], seenUid[i]);
+    blinkTick();   // between the readers so the blinking stays even
+  }
+
+  // 2. Assign
+  const byte* owner[READER_COUNT];
+  if (CHIP_LOCK) {
+    resolveOwners(owner, fresh);
+  } else {
+    for (byte i = 0; i < READER_COUNT; i++) {
+      owner[i] = (seenCount[i] > 0) ? seenUid[i][0] : NULL;
+    }
+  }
+
+  bool changed = false;
+
+  // A chip can only lie on one reader: if it now belongs to another
+  // reader, remove it here at once (no waiting for dropouts)
+  if (CHIP_LOCK) {
+    for (byte i = 0; i < READER_COUNT; i++) {
+      if (!chipPresent[i]) continue;
+      for (byte w = 0; w < READER_COUNT; w++) {
+        if (w != i && owner[w] != NULL &&
+            memcmp(owner[w], currentUid[i], UID_LENGTH) == 0) {
+          if (removeChip(i)) changed = true;
+          break;
+        }
+      }
+    }
+  }
+
+  // 3. Update. A chip assigned only because the reader already showed it
+  //    (not seen this round) counts as a dropout.
+  for (byte i = 0; i < READER_COUNT; i++) {
+    const byte* uid = owner[i];
+    if (uid != NULL && !sawUid(i, uid)) uid = NULL;
+    if (updateReader(i, uid)) changed = true;
+  }
+  return changed;
 }
 
 // ============================ Game logic =================================
@@ -604,6 +1134,21 @@ void confirmAttempt() {
 #endif
     return;
   }
+
+  // Chip lock: one more complete round with a fresh power test. If the
+  // result differs from the display, nothing is confirmed - the player
+  // sees the corrected row and presses again.
+  if (CHIP_LOCK && pollReaders(true)) {
+    blinkOn = true;
+    lastBlinkToggle = millis();
+    drawInputRow();
+    fetchButton();   // discard presses during the check
+#if DEBUG
+    Serial.println(F("Button ignored (input changed during the check)"));
+#endif
+    return;
+  }
+  if (!inputConfirmable()) return;
 
   byte row = currentRow();
   byte green, yellow;
@@ -744,12 +1289,7 @@ void loopStart() {
 }
 
 void loopGame() {
-  bool changed = false;
-
-  for (byte i = 0; i < READER_COUNT; i++) {
-    if (checkReader(i)) changed = true;
-    blinkTick();   // between the readers so the blinking stays even
-  }
+  bool changed = pollReaders(false);
 
   if (changed) {
     // Start visible after every change so the color is seen immediately
@@ -809,7 +1349,15 @@ void setup() {
   attachInterrupt(digitalPinToInterrupt(BUTTON_PIN), buttonISR, CHANGE);
 
   // RFID readers
+  // SPI.begin() uses pins 50/51/52 on the Mega and makes pin 53 (SS) an
+  // output, which keeps the Mega in SPI master mode.
   SPI.begin();
+
+  // Step 1: initialize all readers.
+  // PCD_Init() resets the reader (gain and transmitter power back to the
+  // defaults, antenna on). Because RST is shared, all inits are done first,
+  // and the settings are only made afterwards in a separate loop - so no
+  // later init can undo them.
   for (byte i = 0; i < READER_COUNT; i++) {
     reader[i].PCD_Init();
     delay(10);
@@ -821,10 +1369,15 @@ void setup() {
     Serial.print(F(": "));
     reader[i].PCD_DumpVersionToSerial();
 #endif
+  }
 
-    // If the range is too short, increase the sensitivity:
-    // reader[i].PCD_SetAntennaGain(MFRC522::RxGain_max);
+  // Step 2: set gain + transmitter power and switch off the antennas
+  applyRfidSettings();
+#if DEBUG
+  reportRfidSettings();
+#endif
 
+  for (byte i = 0; i < READER_COUNT; i++) {
     reader[i].PCD_AntennaOff();   // only ever one antenna active at a time
 
     readerColor[i]  = COLOR_WHITE;
@@ -840,6 +1393,10 @@ void setup() {
 }
 
 void loop() {
+#if DEBUG
+  serialTuning();
+#endif
+
   switch (state) {
     case S_START: loopStart(); break;
     case S_GAME:  loopGame();  break;
