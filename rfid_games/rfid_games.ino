@@ -1,36 +1,84 @@
 /* =========================================================================
-   MASTERMIND with 4 RFID readers (RC522), 16x16 LED matrix and button
+   RFID GAMES: MASTERMIND + COLOR MEMORY GAME
+   4 RFID readers (RC522), 16x16 LED matrix and 3 buttons
    -------------------------------------------------------------------------
-   Game idea:
+   Two games share the same hardware. Button 2 selects Mastermind,
+   button 3 selects the Color Memory Game, button 1 starts a game and
+   confirms inputs. After switching on, Mastermind is selected.
+
+   Game selection:
+     On the start and end screens a short press of button 2 / 3 shows the
+     start screen of the selected game.
+     During a running game a short press of button 2 / 3 is ignored, so an
+     accidental press never ends a game. To quit a running game, HOLD
+     button 2 or 3 for ABORT_HOLD_TIME (3 s): the game is ended and the
+     start screen of the selected game appears.
+
+   MASTERMIND
      The Arduino picks a secret sequence of 4 colors
      (Red / Green / Blue / Yellow, colors may repeat).
      The player places a color chip on each of the 4 readers and confirms
-     with the button. The feedback appears to the right:
+     with button 1. The feedback appears to the right:
        Green  = right color in the right position
        Yellow = right color, but wrong position
      The feedback is NOT position-based: first all green, then all yellow
      LEDs, the rest stay off.
 
-   Flow:
-     1. Start screen (scrolling text "MASTERMIND - PRESS BUTTON"). Press the
-        button -> the game starts.
-        The moment the button is pressed serves as the random seed.
-     2. Attempt 1 is in row 1, attempt 2 in row 2, and so on.
-        - No chip on a reader   -> LED white
-        - Chip present          -> LED in the chip color
-        - All 4 occupied        -> row blinks, button confirms
-        If the input is identical to the last attempt, nothing blinks
-        and the button is ignored (protection against double confirmation).
-     3. All 4 correct -> win screen, after MAX_ATTEMPTS -> lose screen.
-     4. Win/lose screen: scrolling text, then the solution as 4 color blocks
-        (win: below it the number of attempts, lose: below it a red X).
-        Scrolling texts: "YOU WIN!" resp. "YOU LOSE".
-        Press the button -> new game.
+     Flow:
+       1. Start screen (scrolling text "MASTERMIND - PRESS BUTTON"). Press
+          button 1 -> the game starts.
+          The moment the button is pressed serves as the random seed.
+       2. Attempt 1 is in row 1, attempt 2 in row 2, and so on.
+          - No chip on a reader   -> LED white
+          - Chip present          -> LED in the chip color
+          - All 4 occupied        -> row blinks, button 1 confirms
+          If the input is identical to the last attempt, nothing blinks
+          and the button is ignored (protection against double confirmation).
+       3. All 4 correct -> win screen, after MM_MAX_ATTEMPTS -> lose screen.
+       4. Win/lose screen: scrolling text, then the solution as 4 color
+          blocks (win: below it the number of attempts, lose: a red X).
+          Scrolling texts: "YOU WIN!" resp. "YOU LOSE".
+          Button 1 -> new game.
 
-   Matrix layout (row/position counted from 1):
-     Row 1..MAX_ATTEMPTS, position 3-6   : inputs
-     Row 1..MAX_ATTEMPTS, position 10-13 : feedback
-     Row 16, position 10-13              : solution (only if DEBUG_SHOW_SOLUTION)
+     Matrix layout (row/position counted from 1):
+       Row 1..MM_MAX_ATTEMPTS, position 3-6   : inputs
+       Row 1..MM_MAX_ATTEMPTS, position 10-13 : feedback
+       Row 16, position 10-13                 : solution (only if MM_DEBUG_SHOW_SOLUTION)
+
+   COLOR MEMORY GAME
+     Every round the Arduino generates a COMPLETELY NEW random sequence
+     (the old one is not extended). Round 1 has 1 color, round 2 has 2
+     colors, and so on up to CM_MAX_LENGTH (20). After that every round
+     has 20 colors (endless).
+
+     Flow:
+       1. Start screen (scrolling text "COLOR MEMORY GAME - PRESS BUTTON").
+          Button 1 -> round 1 starts (random seed = moment of the press).
+       2. The whole sequence is shown at once on a grid of 5 rows x 4
+          positions. Sequence position n has a fixed place:
+          grid row = n / 4, grid position = n % 4. The display time grows
+          with the length (CM_SHOW_TIME_BASE + CM_SHOW_TIME_PER_COLOR per
+          color). Then all used grid places turn white.
+       3. Input in blocks of 4: reader 1..4 = position 1..4 of the current
+          grid row. The last block only needs as many readers as colors are
+          left; the readers not needed are not read at all and can never
+          get a chip (-> no cross-reading onto an empty reader, see
+          activeReaderCount()). When all required readers carry a known chip, the row
+          blinks and button 1 confirms the block. Confirmed blocks stay
+          visible in their colors. Before the next block can be confirmed,
+          the chips have to be removed from the required readers (this
+          also prevents a double confirmation).
+       4. Only after the complete sequence has been entered is it compared
+          position by position: directly below every color a green (correct)
+          or red (wrong) LED appears. Every correct position = 1 point. The
+          score adds up over all rounds of a game.
+       5. Everything correct -> next round. At least one wrong position ->
+          Game over screen: scrolling text "GAME OVER", then the score.
+          Button 1 -> new game.
+
+     Matrix layout (row/position counted from 1):
+       Grid positions 2, 6, 11, 15
+       Input rows 2, 5, 8, 11, 14 - feedback directly below: 3, 6, 9, 12, 15
 
    Colors: index in colors[]
        0 = White (no / unknown chip)
@@ -53,11 +101,12 @@
        SDA/SS reader 4 -> Pin 6
      LED matrix:
        DIN   -> Pin 5
-     Button (confirm):
-       one contact -> Pin 2, other contact -> GND
-       (internal pullup, pressed = LOW)
-     Reserved (in the schematic, not used by this firmware):
-       Button 2 -> Pin 3, Button 3 -> Pin 18 (both interrupt-capable)
+     Buttons (one contact -> pin, other contact -> GND,
+     internal pullup, pressed = LOW, all interrupt-capable):
+       Button 1 (start / confirm)          -> Pin 2
+       Button 2 (select Mastermind)        -> Pin 3
+       Button 3 (select Color Memory Game) -> Pin 18 (TX1, free as long as
+                                              Serial1 is not used)
      Pin 53 (hardware SS) stays unconnected. It must remain an OUTPUT so
      the Mega stays SPI master - SPI.begin() takes care of that.
    ========================================================================= */
@@ -73,21 +122,37 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_NeoMatrix.h>
 #include <Adafruit_NeoPixel.h>
+#include <Fonts/TomThumb.h>   // small 3x5 font for numbers with 3-4 digits
 #include <avr/pgmspace.h>
 
 // ============================== Settings =================================
 
-// 1 = serial output on (read UIDs, show solution, feedback)
+// 1 = serial output on (read UIDs, solution, feedback)
 // 0 = off (saves memory, for the finished game)
 #define DEBUG 1
 
+// ------------------------------ Mastermind -------------------------------
+
 // true = show the secret sequence in row 16 during the game (for testing)
-const bool DEBUG_SHOW_SOLUTION = false;
+const bool MM_DEBUG_SHOW_SOLUTION = false;
 
 // Maximum number of attempts, after which the game is lost
-const byte MAX_ATTEMPTS = 10;
-static_assert(MAX_ATTEMPTS >= 1 && MAX_ATTEMPTS <= 15,
-              "MAX_ATTEMPTS must be between 1 and 15 (row 16 is reserved for the debug solution)");
+const byte MM_MAX_ATTEMPTS = 10;
+static_assert(MM_MAX_ATTEMPTS >= 1 && MM_MAX_ATTEMPTS <= 15,
+              "MM_MAX_ATTEMPTS must be between 1 and 15 (row 16 is reserved for the debug solution)");
+
+// -------------------------- Color Memory Game ----------------------------
+
+// Maximum length of the memory sequence (grid: 5 rows x 4 positions).
+// Once reached, every further round has this length (endless).
+const byte CM_MAX_LENGTH = 20;
+
+// Times in milliseconds
+const unsigned int CM_SHOW_PAUSE          = 300;   // dark pause before the sequence appears
+const unsigned int CM_SHOW_TIME_BASE      = 1000;  // display time of the sequence ...
+const unsigned int CM_SHOW_TIME_PER_COLOR = 500;   // ... plus this much per color
+
+// ------------------------------- Shared ----------------------------------
 
 // Matrix brightness (0..255)
 const byte BRIGHTNESS = 4;
@@ -95,9 +160,10 @@ const byte BRIGHTNESS = 4;
 // Times in milliseconds
 const unsigned int BLINK_INTERVAL     = 250;   // blinking of a complete input
 const unsigned int SCROLL_INTERVAL    = 70;    // speed of the scrolling texts (smaller = faster)
-const unsigned int END_IMAGE_DURATION = 4000;  // how long the solution image stays
-const unsigned int RESULT_PAUSE       = 1500;  // show the last feedback before the end screen appears
+const unsigned int END_IMAGE_DURATION = 4000;  // how long the end image stays
+const unsigned int RESULT_PAUSE       = 1500;  // show the last feedback before the next screen
 const byte         DEBOUNCE_TIME      = 30;    // button debounce
+const unsigned int ABORT_HOLD_TIME    = 3000;  // hold button 2 / 3 this long to quit a running game
 
 // --------------------------------- Pins ----------------------------------
 
@@ -105,9 +171,17 @@ const byte         DEBOUNCE_TIME      = 30;    // button debounce
 // only for reference): MISO = 50, MOSI = 51, SCK = 52, SS = 53.
 
 const byte MATRIX_PIN = 5;
-const byte BUTTON_PIN = 2;   // interrupt-capable on the Mega (D2, D3, D18-D21)
 
-const byte READER_COUNT = 4;   // = length of the color sequence
+// Buttons. All pins are interrupt-capable on the Mega (D2, D3, D18-D21).
+const byte BUTTON_COUNT        = 3;
+const byte BUTTON_CONFIRM      = 0;   // button 1: start / confirm
+const byte BUTTON_MASTERMIND   = 1;   // button 2: select Mastermind
+const byte BUTTON_COLOR_MEMORY = 2;   // button 3: select Color Memory Game
+
+// Pin 18 = TX1, free as long as Serial1 is not used
+const byte BUTTON_PINS[BUTTON_COUNT] = { 2, 3, 18 };
+
+const byte READER_COUNT = 4;   // = length of a Mastermind sequence / of an input block
 
 const byte RST_PIN  = 9;   // shared by all readers
 const byte SS_PIN_1 = 10;
@@ -172,14 +246,32 @@ const unsigned int PROBE_CACHE_TIME = 3000;
 
 // ------------------------------ Layout -----------------------------------
 
+// --- Mastermind ---
+
 // Columns (position from 1) of the input - readers 1..4
-const byte READER_LED_POSITION[READER_COUNT] = { 3, 4, 5, 6 };
+const byte MM_READER_LED_POSITION[READER_COUNT] = { 3, 4, 5, 6 };
 
 // Columns (position from 1) of the feedback
-const byte FEEDBACK_POSITION[READER_COUNT] = { 10, 11, 12, 13 };
+const byte MM_FEEDBACK_POSITION[READER_COUNT] = { 10, 11, 12, 13 };
 
 // Row for the debug display of the solution
-const byte SOLUTION_DEBUG_ROW = 16;
+const byte MM_SOLUTION_DEBUG_ROW = 16;
+
+// --- Color Memory Game ---
+// Grid of CM_ROW_COUNT rows x 4 positions. Sequence position n (from 0)
+// lies in grid row n / 4 at grid position n % 4.
+
+const byte CM_ROW_COUNT = 5;
+
+// Columns (position from 1) of the grid - readers 1..4
+const byte CM_GRID_POSITION[READER_COUNT] = { 2, 6, 11, 15 };
+
+// Rows (from 1) of the colors and of the feedback directly below them
+const byte CM_INPUT_ROW[CM_ROW_COUNT]    = { 2, 5, 8, 11, 14 };
+const byte CM_FEEDBACK_ROW[CM_ROW_COUNT] = { 3, 6, 9, 12, 15 };
+
+static_assert(CM_MAX_LENGTH >= 1 && CM_MAX_LENGTH <= CM_ROW_COUNT * READER_COUNT,
+              "CM_MAX_LENGTH must be between 1 and 20 (grid of 5 rows x 4 positions)");
 
 // ------------------------------ Colors -----------------------------------
 
@@ -205,9 +297,11 @@ const byte OFF[3] = { 0, 0, 0 };
 // ------------------------------ Texts ------------------------------------
 // Texts on the matrix. Stored in flash (PROGMEM) instead of RAM.
 
-const char TEXT_START[] PROGMEM = "MASTERMIND - PRESS BUTTON";
-const char TEXT_WIN[]   PROGMEM = "YOU WIN!";
-const char TEXT_LOSE[]  PROGMEM = "YOU LOSE";
+const char TEXT_MM_START[]     PROGMEM = "MASTERMIND - PRESS BUTTON";
+const char TEXT_MM_WIN[]       PROGMEM = "YOU WIN!";
+const char TEXT_MM_LOSE[]      PROGMEM = "YOU LOSE";
+const char TEXT_CM_START[]     PROGMEM = "COLOR MEMORY GAME - PRESS BUTTON";
+const char TEXT_CM_GAME_OVER[] PROGMEM = "GAME OVER";
 
 // Default font: 5x7 pixels, 6 pixels wide including spacing
 const byte CHAR_WIDTH = 6;
@@ -267,18 +361,33 @@ MFRC522 reader[READER_COUNT] = {
 
 // ------------------------------- State -----------------------------------
 
-// Game states
-const byte S_START = 0;   // start screen
-const byte S_GAME  = 1;   // running game
-const byte S_WON   = 2;   // win screen
-const byte S_LOST  = 3;   // lose screen
+// States - Mastermind
+const byte S_MM_START     = 0;   // start screen
+const byte S_MM_GAME      = 1;   // running game
+const byte S_MM_WON       = 2;   // win screen
+const byte S_MM_LOST      = 3;   // lose screen
+// States - Color Memory Game
+const byte S_CM_START     = 4;   // start screen
+const byte S_CM_SHOW      = 5;   // sequence is being shown
+const byte S_CM_INPUT     = 6;   // player enters the sequence
+const byte S_CM_GAME_OVER = 7;   // game over screen
 
-byte state = S_START;
+byte state = S_MM_START;
 
-// Game
-byte secretCode[READER_COUNT];   // color indices 1..4
-byte lastAttempt[READER_COUNT];  // last confirmed input (0 = none yet)
-byte attemptCount = 0;           // number of attempts already confirmed
+// Mastermind
+byte mmSecretCode[READER_COUNT];   // color indices 1..4
+byte mmLastAttempt[READER_COUNT];  // last confirmed input (0 = none yet)
+byte mmAttemptCount = 0;           // number of attempts already confirmed
+
+// Color Memory Game
+byte cmSequence[CM_MAX_LENGTH];    // color indices 1..4
+byte cmInput[CM_MAX_LENGTH];       // confirmed input of the player
+byte cmLength = 0;                 // length of the current sequence
+byte cmInputPosition = 0;          // number of colors already confirmed
+unsigned int cmScore = 0;          // correct positions over all rounds
+bool cmWaitForEmpty = false;       // chips of the last block still have to be removed
+bool cmSequenceVisible = false;    // S_CM_SHOW: false = dark pause, true = sequence visible
+unsigned long cmShowSince = 0;     // start of the current S_CM_SHOW phase
 
 // Blinking
 bool blinkOn = true;
@@ -317,36 +426,76 @@ struct ProbeResult {
 };
 ProbeResult probeCache[READER_COUNT];
 
-// Button (written inside the interrupt -> volatile)
-volatile bool buttonPressed = false;
-volatile unsigned long lastButtonEdge = 0;
-volatile unsigned long buttonTimeIsr = 0;   // micros() at press
-unsigned long buttonTime = 0;               // copy for the main program
+// Buttons (written inside the interrupts -> volatile)
+volatile bool buttonPressed[BUTTON_COUNT];
+volatile unsigned long lastButtonEdge[BUTTON_COUNT];
+volatile unsigned long buttonTimeIsr[BUTTON_COUNT];   // micros() at press
+volatile unsigned long buttonPressMillis[BUTTON_COUNT]; // millis() at press (for holding)
+volatile bool buttonHoldUsed[BUTTON_COUNT];           // this press may no longer count as "held"
+unsigned long buttonTime = 0;                         // copy for the main program
 
-// ============================== Button ===================================
+// ============================== Buttons ==================================
 
-// Interrupt on every level change at the button pin (pin 2).
+// Called on every level change at a button pin.
 // A press only counts if the pin is LOW and the last edge is longer ago
 // than DEBOUNCE_TIME. The bouncing on press AND on release produces edges
 // in quick succession and is thereby ignored.
-void buttonISR() {
+void handleButtonEdge(byte b) {
   unsigned long now = millis();
-  if (digitalRead(BUTTON_PIN) == LOW && (now - lastButtonEdge) >= DEBOUNCE_TIME) {
-    buttonPressed = true;
-    buttonTimeIsr = micros();
+  if (digitalRead(BUTTON_PINS[b]) == LOW && (now - lastButtonEdge[b]) >= DEBOUNCE_TIME) {
+    buttonPressed[b]     = true;
+    buttonTimeIsr[b]     = micros();
+    buttonPressMillis[b] = now;     // a new press starts a new hold
+    buttonHoldUsed[b]    = false;
   }
-  lastButtonEdge = now;
+  lastButtonEdge[b] = now;
 }
 
-// Returns true if a press occurred since the last call, and resets the
-// flag. Can also be used to "discard" old presses.
-bool fetchButton() {
+// One interrupt routine per button (an ISR cannot take parameters)
+void buttonConfirmISR()     { handleButtonEdge(BUTTON_CONFIRM); }
+void buttonMastermindISR()  { handleButtonEdge(BUTTON_MASTERMIND); }
+void buttonColorMemoryISR() { handleButtonEdge(BUTTON_COLOR_MEMORY); }
+
+// Returns true if button b was pressed since the last call, and resets
+// the flag. The moment of the press is copied to buttonTime.
+// Can also be used to "discard" old presses.
+bool fetchButton(byte b) {
   noInterrupts();
-  bool pressed = buttonPressed;
-  buttonPressed = false;
-  buttonTime = buttonTimeIsr;
+  bool pressed = buttonPressed[b];
+  buttonPressed[b] = false;
+  if (pressed) buttonTime = buttonTimeIsr[b];
   interrupts();
   return pressed;
+}
+
+// Discards pending presses of all buttons
+void discardButtons() {
+  for (byte b = 0; b < BUTTON_COUNT; b++) fetchButton(b);
+}
+
+// Is button b still held down, for at least ABORT_HOLD_TIME since its last
+// press? The press time comes from the interrupt; whether the button is
+// still down is read directly from the pin. A release and a new press
+// start a new hold, because the interrupt then stores a new press time.
+bool buttonHeld(byte b) {
+  noInterrupts();
+  unsigned long pressedAt = buttonPressMillis[b];
+  bool used = buttonHoldUsed[b];
+  interrupts();
+
+  return !used &&
+         digitalRead(BUTTON_PINS[b]) == LOW &&
+         millis() - pressedAt >= ABORT_HOLD_TIME;
+}
+
+// Buttons that are held down at this moment no longer count as "held"
+// until they are released and pressed again. Called when a game starts
+// (a button held since the start screen must not quit the new game) and
+// after quitting (the button is usually still down).
+void cancelHolds() {
+  noInterrupts();
+  for (byte b = 0; b < BUTTON_COUNT; b++) buttonHoldUsed[b] = true;
+  interrupts();
 }
 
 // ============================ LED matrix =================================
@@ -399,6 +548,43 @@ bool scrollTextStep(const char* text, const byte* color) {
     return true;
   }
   return false;
+}
+
+// Draws a number (0..9999) horizontally centered. y = top row (from 0)
+// of a 7-pixel-high area.
+//   1-2 digits: default font, bold (2 pixels wide)
+//   3-4 digits: small 3x5 font (TomThumb), vertically centered in the area
+// Larger values are shown as 9999.
+void drawNumber(unsigned int value, int16_t y, const byte color[3]) {
+  if (value > 9999) value = 9999;
+
+  char numStr[6];
+  utoa(value, numStr, 10);
+  byte length = strlen(numStr);
+  uint16_t c = colorValue(color);
+
+  if (length <= 2) {
+    const byte BOLD_WIDTH = 6;   // 5-pixel character + 1-pixel thickening
+    const byte SPACING    = 2;   // gap between two digits
+    byte total = length * BOLD_WIDTH + (length - 1) * SPACING;
+    int16_t x = (16 - total) / 2;
+    for (byte i = 0; i < length; i++) {
+      int16_t xc = x + i * (BOLD_WIDTH + SPACING);
+      matrix.drawChar(xc,     y, numStr[i], c, c, 1);
+      matrix.drawChar(xc + 1, y, numStr[i], c, c, 1);   // offset by 1 pixel = bold
+    }
+
+  } else {
+    const byte SMALL_WIDTH = 4;   // 3-pixel digit + 1-pixel spacing
+    byte total = length * SMALL_WIDTH - 1;
+    int16_t x = (16 - total) / 2;
+    matrix.setFont(&TomThumb);
+    for (byte i = 0; i < length; i++) {
+      // Custom fonts are drawn at the baseline: digit rows y+1 .. y+5
+      matrix.drawChar(x + i * SMALL_WIDTH, y + 6, numStr[i], c, c, 1);
+    }
+    matrix.setFont(NULL);         // back to the default font
+  }
 }
 
 // ============================== RFID =====================================
@@ -543,9 +729,9 @@ void report(byte index, const byte* uid) {
   Serial.println();
 }
 
-// Prints a color sequence to serial, e.g. "Red Yellow Yellow Blue"
-void reportSequence(const byte* sequence) {
-  for (byte i = 0; i < READER_COUNT; i++) {
+// Prints a color sequence to serial, e.g. "Red Yellow Yellow Blue "
+void reportSequence(const byte* sequence, byte length) {
+  for (byte i = 0; i < length; i++) {
     Serial.print(COLOR_NAMES[sequence[i]]);
     Serial.print(' ');
   }
@@ -669,9 +855,15 @@ void checkTable() {
 // ============================ Chip lock ==================================
 //
 // Every polling round runs in three steps (pollReaders):
-//   1. Read:    every reader reads ALL chips in its field.
+//   1. Read:    every ACTIVE reader reads ALL chips in its field.
 //   2. Assign:  every chip is assigned to at most one reader (resolveOwners).
 //   3. Update:  the display state of every reader is updated (updateReader).
+//
+// Only the active readers take part (activeReaderCount(): Mastermind all 4,
+// Color Memory Game only the readers of the current block). An inactive
+// reader is not read and forgets its chip, so it is never a candidate.
+// Example (block of 2): a chip seen by readers 2 and 3 can only belong to
+// reader 2, because reader 3 is not read at all.
 //
 // Assignment rules, applied repeatedly until everything is decided:
 //   a) Elimination: if only one free reader is left for a chip, the chip
@@ -690,7 +882,8 @@ void checkTable() {
 // if it missed it in this round (dropout) - so a single dropout does not
 // hand the chip over to a neighbor.
 
-void blinkTick();   // defined in the game logic
+void blinkTick();          // defined in "Shared game helpers"
+byte activeReaderCount();  // defined in "Shared game helpers"
 
 // Pointer to the UID behind a list reference (reader * MAX + index)
 const byte* seenUidAt(byte ref) {
@@ -1000,12 +1193,22 @@ bool updateReader(byte i, const byte* uid) {
   return false;
 }
 
-// One complete polling round over all readers.
+// One complete polling round over all active readers.
 // fresh = true: ignore remembered power-test results (before confirming).
 // Returns true if a displayed color has changed.
 bool pollReaders(bool fresh) {
+  byte active = activeReaderCount();
+
   // 1. Read
   for (byte i = 0; i < READER_COUNT; i++) {
+    if (i >= active) {
+      // Inactive reader: not read, so it cannot see or own a chip.
+      // A chip it still shows from before is forgotten. This is not a
+      // "change", because an inactive reader is not displayed.
+      seenCount[i] = 0;
+      if (chipPresent[i]) removeChip(i);
+      continue;
+    }
     seenCount[i] = readAllChips(reader[i], seenUid[i]);
     blinkTick();   // between the readers so the blinking stays even
   }
@@ -1047,38 +1250,38 @@ bool pollReaders(bool fresh) {
   return changed;
 }
 
-// ============================ Game logic =================================
+// ========================= Shared game helpers ===========================
+// Active readers and blinking of the input row, used by both games. The
+// functions pass the work on to the game that is currently running
+// (depending on state).
 
-void startEndScreen(bool won);   // defined further below
+bool mmInputConfirmable();   // defined in "Mastermind"
+void mmDrawInputRow();
+bool cmInputConfirmable();   // defined in "Color Memory Game"
+void cmDrawInputRow();
+byte cmBlockSize();
 
-// Row (from 1) in which input currently happens
-byte currentRow() {
-  return attemptCount + 1;
+// Number of readers the running game needs at the moment (readers
+// 1..count). Only these are read by pollReaders() and can get a chip.
+//   Mastermind:        always all 4
+//   Color Memory Game: the readers of the current block (fewer for the
+//                      last block, e.g. only 1 in round 1)
+byte activeReaderCount() {
+  if (state == S_CM_INPUT) return cmBlockSize();
+  return READER_COUNT;
 }
 
-// Is a known chip present on all readers?
-bool inputComplete() {
-  for (byte i = 0; i < READER_COUNT; i++) {
-    if (readerColor[i] == COLOR_WHITE) return false;
-  }
-  return true;
-}
-
-// Complete AND different from the last attempt -> may be confirmed
+// May the current input be confirmed? (-> row blinks)
 bool inputConfirmable() {
-  return inputComplete() &&
-         memcmp(readerColor, lastAttempt, READER_COUNT) != 0;
+  if (state == S_MM_GAME)  return mmInputConfirmable();
+  if (state == S_CM_INPUT) return cmInputConfirmable();
+  return false;
 }
 
-// Draws the current input row (takes the blinking into account)
+// Draws the current input row of the running game
 void drawInputRow() {
-  bool visible = !inputConfirmable() || blinkOn;
-
-  for (byte i = 0; i < READER_COUNT; i++) {
-    setLED(currentRow(), READER_LED_POSITION[i],
-           visible ? colors[readerColor[i]] : OFF);
-  }
-  matrix.show();
+  if (state == S_MM_GAME)       mmDrawInputRow();
+  else if (state == S_CM_INPUT) cmDrawInputRow();
 }
 
 // Advance the blinking when the time is up
@@ -1092,9 +1295,51 @@ void blinkTick() {
   }
 }
 
+// Start the blinking visible and draw the input row at once
+// (after every change, so the color is seen immediately)
+void restartBlink() {
+  blinkOn = true;
+  lastBlinkToggle = millis();
+  drawInputRow();
+}
+
+void startEndScreen(byte endState);   // defined in "Screens"
+
+// ============================== Mastermind ===============================
+
+// Row (from 1) in which input currently happens
+byte mmCurrentRow() {
+  return mmAttemptCount + 1;
+}
+
+// Is a known chip present on all readers?
+bool mmInputComplete() {
+  for (byte i = 0; i < READER_COUNT; i++) {
+    if (readerColor[i] == COLOR_WHITE) return false;
+  }
+  return true;
+}
+
+// Complete AND different from the last attempt -> may be confirmed
+bool mmInputConfirmable() {
+  return mmInputComplete() &&
+         memcmp(readerColor, mmLastAttempt, READER_COUNT) != 0;
+}
+
+// Draws the current input row (takes the blinking into account)
+void mmDrawInputRow() {
+  bool visible = !mmInputConfirmable() || blinkOn;
+
+  for (byte i = 0; i < READER_COUNT; i++) {
+    setLED(mmCurrentRow(), MM_READER_LED_POSITION[i],
+           visible ? colors[readerColor[i]] : OFF);
+  }
+  matrix.show();
+}
+
 // Compares an attempt with the secret sequence.
 // green = right color + position, yellow = right color, wrong position
-void evaluate(const byte* attempt, byte &green, byte &yellow) {
+void mmEvaluate(const byte* attempt, byte &green, byte &yellow) {
   byte remainingSecret[COLOR_COUNT]  = { 0 };
   byte remainingAttempt[COLOR_COUNT] = { 0 };
 
@@ -1102,11 +1347,11 @@ void evaluate(const byte* attempt, byte &green, byte &yellow) {
   yellow = 0;
 
   for (byte i = 0; i < READER_COUNT; i++) {
-    if (attempt[i] == secretCode[i]) {
+    if (attempt[i] == mmSecretCode[i]) {
       green++;
     } else {
       // Only count the positions that were not hit for "yellow"
-      remainingSecret[secretCode[i]]++;
+      remainingSecret[mmSecretCode[i]]++;
       remainingAttempt[attempt[i]]++;
     }
   }
@@ -1117,18 +1362,18 @@ void evaluate(const byte* attempt, byte &green, byte &yellow) {
 }
 
 // Show the feedback: first green, then yellow, rest off
-void drawFeedback(byte row, byte green, byte yellow) {
+void mmDrawFeedback(byte row, byte green, byte yellow) {
   for (byte i = 0; i < READER_COUNT; i++) {
     const byte* f = OFF;
-    if (i < green)              f = colors[COLOR_GREEN];
+    if (i < green)               f = colors[COLOR_GREEN];
     else if (i < green + yellow) f = colors[COLOR_YELLOW];
-    setLED(row, FEEDBACK_POSITION[i], f);
+    setLED(row, MM_FEEDBACK_POSITION[i], f);
   }
 }
 
-// Button was pressed during the game
-void confirmAttempt() {
-  if (!inputConfirmable()) {
+// Button 1 was pressed during the game
+void mmConfirmAttempt() {
+  if (!mmInputConfirmable()) {
 #if DEBUG
     Serial.println(F("Button ignored (input incomplete or same as last time)"));
 #endif
@@ -1139,36 +1384,34 @@ void confirmAttempt() {
   // result differs from the display, nothing is confirmed - the player
   // sees the corrected row and presses again.
   if (CHIP_LOCK && pollReaders(true)) {
-    blinkOn = true;
-    lastBlinkToggle = millis();
-    drawInputRow();
-    fetchButton();   // discard presses during the check
+    restartBlink();
+    fetchButton(BUTTON_CONFIRM);   // discard presses during the check
 #if DEBUG
     Serial.println(F("Button ignored (input changed during the check)"));
 #endif
     return;
   }
-  if (!inputConfirmable()) return;
+  if (!mmInputConfirmable()) return;
 
-  byte row = currentRow();
+  byte row = mmCurrentRow();
   byte green, yellow;
-  evaluate(readerColor, green, yellow);
+  mmEvaluate(readerColor, green, yellow);
 
   // Leave the input fixed (not blinking) + feedback next to it
   for (byte i = 0; i < READER_COUNT; i++) {
-    setLED(row, READER_LED_POSITION[i], colors[readerColor[i]]);
+    setLED(row, MM_READER_LED_POSITION[i], colors[readerColor[i]]);
   }
-  drawFeedback(row, green, yellow);
+  mmDrawFeedback(row, green, yellow);
   matrix.show();
 
-  memcpy(lastAttempt, readerColor, READER_COUNT);
-  attemptCount++;
+  memcpy(mmLastAttempt, readerColor, READER_COUNT);
+  mmAttemptCount++;
 
 #if DEBUG
   Serial.print(F("Attempt "));
-  Serial.print(attemptCount);
+  Serial.print(mmAttemptCount);
   Serial.print(F(": "));
-  reportSequence(lastAttempt);
+  reportSequence(mmLastAttempt, READER_COUNT);
   Serial.print(F("-> green "));
   Serial.print(green);
   Serial.print(F(", yellow "));
@@ -1177,148 +1420,472 @@ void confirmAttempt() {
 
   if (green == READER_COUNT) {
     delay(RESULT_PAUSE);
-    startEndScreen(true);
-  } else if (attemptCount >= MAX_ATTEMPTS) {
+    startEndScreen(S_MM_WON);
+  } else if (mmAttemptCount >= MM_MAX_ATTEMPTS) {
     delay(RESULT_PAUSE);
-    startEndScreen(false);
+    startEndScreen(S_MM_LOST);
   } else {
     // Next row: immediately shows the chips present (not blinking,
     // since identical to the attempt just confirmed)
-    blinkOn = true;
-    lastBlinkToggle = millis();
-    drawInputRow();
+    restartBlink();
   }
 }
 
 // Generate the secret sequence and start a new game
-void newGame() {
+void mmNewGame() {
   randomSeed(buttonTime);   // moment of the button press = true randomness
 
   for (byte i = 0; i < READER_COUNT; i++) {
-    secretCode[i]  = random(1, COLOR_COUNT);   // 1..4
-    lastAttempt[i] = COLOR_WHITE;              // no attempt yet
+    mmSecretCode[i]  = random(1, COLOR_COUNT);   // 1..4
+    mmLastAttempt[i] = COLOR_WHITE;              // no attempt yet
   }
-  attemptCount = 0;
+  mmAttemptCount = 0;
 
   matrix.fillScreen(0);
 
-  if (DEBUG_SHOW_SOLUTION) {
+  if (MM_DEBUG_SHOW_SOLUTION) {
     for (byte i = 0; i < READER_COUNT; i++) {
-      setLED(SOLUTION_DEBUG_ROW, FEEDBACK_POSITION[i], colors[secretCode[i]]);
+      setLED(MM_SOLUTION_DEBUG_ROW, MM_FEEDBACK_POSITION[i], colors[mmSecretCode[i]]);
     }
   }
 
 #if DEBUG
-  Serial.print(F("=== New game === Solution: "));
-  reportSequence(secretCode);
+  Serial.print(F("=== New Mastermind game === Solution: "));
+  reportSequence(mmSecretCode, READER_COUNT);
   Serial.println();
 #endif
 
-  blinkOn = true;
-  lastBlinkToggle = millis();
-  drawInputRow();
+  state = S_MM_GAME;   // before restartBlink(): drawInputRow() depends on the state
+  restartBlink();
 
-  fetchButton();   // discard old button presses
-  state = S_GAME;
+  discardButtons();    // discard old button presses
+  cancelHolds();       // a button held since the start screen does not quit the game
 }
 
-// ============================== Screens ==================================
-
-void startStartScreen() {
-  state = S_START;
-  scrollX = 16;
-  fetchButton();
-}
-
-void startEndScreen(bool won) {
-  state = won ? S_WON : S_LOST;
-  scrollX = 16;
-  endImageActive = false;
-  fetchButton();   // discard presses during the result pause
-
-#if DEBUG
-  Serial.println(won ? F("*** WON ***") : F("*** LOST ***"));
-#endif
-}
-
-// Still image: solution as 4 color blocks (3x3), below it attempts resp. red X
-void drawEndImage() {
+// Still image: solution as 4 color blocks (2x2), below it attempts resp. red X
+void mmDrawEndImage() {
   matrix.fillScreen(0);
 
-  // Solution, blocks at x = 1, 5, 9, 13 and y = 1..3
+  // Solution, blocks at x = 1, 5, 9, 13 and y = 2..3 (from 0)
   for (byte i = 0; i < READER_COUNT; i++) {
-    matrix.fillRect(1 + i * 4, 2, 2, 2, colorValue(colors[secretCode[i]]));
+    matrix.fillRect(1 + i * 4, 2, 2, 2, colorValue(colors[mmSecretCode[i]]));
   }
 
-  if (state == S_WON) {
-        // Number of attempts, bold (2 pixels wide) and centered
-    char numStr[4];
-    itoa(attemptCount, numStr, 10);
-    byte length = strlen(numStr);
-    const byte BOLD_WIDTH = 6;   // 5-pixel character + 1-pixel thickening
-    const byte SPACING    = 2;   // gap between two digits
-    byte total = length * BOLD_WIDTH + (length - 1) * SPACING;
-    int16_t x = (16 - total) / 2;
-    uint16_t c = colorValue(colors[COLOR_GREEN]);
-    for (byte i = 0; i < length; i++) {
-      int16_t xc = x + i * (BOLD_WIDTH + SPACING);
-      matrix.drawChar(xc,     7, numStr[i], c, c, 1);
-      matrix.drawChar(xc + 1, 7, numStr[i], c, c, 1);   // offset by 1 pixel = bold
-    }
+  if (state == S_MM_WON) {
+    // Number of attempts, bold and centered
+    drawNumber(mmAttemptCount, 7, colors[COLOR_GREEN]);
 
   } else {
-      // Red X, 2 pixels wide (columns 4-11, rows 7-13) -> exactly centered
-      uint16_t c = colorValue(colors[COLOR_RED]);
-      matrix.drawLine(4, 7, 10, 13, c);   // "\" left half
-      matrix.drawLine(5, 7, 11, 13, c);   // "\" right half
-      matrix.drawLine(11, 7, 5, 13, c);   // "/" right half
-      matrix.drawLine(10, 7, 4, 13, c);   // "/" left half
+    // Red X, 2 pixels wide (columns 4-11, rows 7-13) -> exactly centered
+    uint16_t c = colorValue(colors[COLOR_RED]);
+    matrix.drawLine(4, 7, 10, 13, c);   // "\" left half
+    matrix.drawLine(5, 7, 11, 13, c);   // "\" right half
+    matrix.drawLine(11, 7, 5, 13, c);   // "/" right half
+    matrix.drawLine(10, 7, 4, 13, c);   // "/" left half
   }
 
   matrix.show();
 }
 
-// ============================== States ===================================
+// ========================== Color Memory Game ============================
 
-void loopStart() {
-  if (fetchButton()) {
-    newGame();
-    return;
-  }
-  scrollTextStep(TEXT_START, NULL);   // colorful
+// Set the grid LED of sequence position index (from 0)
+void cmSetGridLED(byte index, const byte color[3]) {
+  setLED(CM_INPUT_ROW[index / READER_COUNT],
+         CM_GRID_POSITION[index % READER_COUNT], color);
 }
 
-void loopGame() {
-  bool changed = pollReaders(false);
+// Set the feedback LED directly below sequence position index (from 0)
+void cmSetFeedbackLED(byte index, const byte color[3]) {
+  setLED(CM_FEEDBACK_ROW[index / READER_COUNT],
+         CM_GRID_POSITION[index % READER_COUNT], color);
+}
 
-  if (changed) {
-    // Start visible after every change so the color is seen immediately
-    blinkOn = true;
-    lastBlinkToggle = millis();
-    drawInputRow();
+// Number of readers needed for the current block
+// (4, for the last block only the colors that are left)
+byte cmBlockSize() {
+  byte remaining = cmLength - cmInputPosition;
+  return (remaining < READER_COUNT) ? remaining : READER_COUNT;
+}
+
+// Are all readers of the current block free of chips?
+bool cmBlockReadersEmpty() {
+  for (byte i = 0; i < cmBlockSize(); i++) {
+    if (chipPresent[i]) return false;
+  }
+  return true;
+}
+
+// Is a known chip present on all readers of the current block?
+bool cmInputComplete() {
+  for (byte i = 0; i < cmBlockSize(); i++) {
+    if (readerColor[i] == COLOR_WHITE) return false;
+  }
+  return true;
+}
+
+// Complete AND the chips of the last block were removed -> may be confirmed
+bool cmInputConfirmable() {
+  return !cmWaitForEmpty && cmInputComplete();
+}
+
+// Draws the current input row (takes the blinking into account)
+void cmDrawInputRow() {
+  bool visible = !cmInputConfirmable() || blinkOn;
+
+  for (byte i = 0; i < cmBlockSize(); i++) {
+    cmSetGridLED(cmInputPosition + i,
+                 visible ? colors[readerColor[i]] : OFF);
+  }
+  matrix.show();
+}
+
+// Display time of the sequence, grows with its length
+unsigned long cmShowDuration() {
+  return CM_SHOW_TIME_BASE + (unsigned long)cmLength * CM_SHOW_TIME_PER_COLOR;
+}
+
+// Next round: generate a COMPLETELY NEW sequence, one color longer than
+// before (up to CM_MAX_LENGTH), and start showing it.
+void cmNextRound() {
+  if (cmLength < CM_MAX_LENGTH) cmLength++;
+
+  for (byte i = 0; i < cmLength; i++) {
+    cmSequence[i] = random(1, COLOR_COUNT);   // 1..4
+  }
+  cmInputPosition = 0;
+  cmWaitForEmpty  = true;   // chips of the last round must be removed first
+
+#if DEBUG
+  Serial.print(F("New round, "));
+  Serial.print(cmLength);
+  Serial.print(F(" colors: "));
+  reportSequence(cmSequence, cmLength);
+  Serial.println();
+#endif
+
+  matrix.fillScreen(0);
+  matrix.show();
+
+  cmSequenceVisible = false;   // dark pause first
+  cmShowSince = millis();
+  state = S_CM_SHOW;
+}
+
+// Start a new game in round 1
+void cmNewGame() {
+  randomSeed(buttonTime);   // moment of the button press = true randomness
+
+  cmLength = 0;
+  cmScore  = 0;
+  cancelHolds();   // a button held since the start screen does not quit the game
+
+#if DEBUG
+  Serial.println(F("=== New Color Memory game ==="));
+#endif
+
+  cmNextRound();
+}
+
+// End of the display: all used grid places turn white, input begins
+void cmStartInput() {
+  for (byte i = 0; i < cmLength; i++) {
+    cmSetGridLED(i, colors[COLOR_WHITE]);
   }
 
-  if (fetchButton()) {
-    confirmAttempt();
+  state = S_CM_INPUT;   // before restartBlink(): drawInputRow() depends on the state
+  restartBlink();
+
+  discardButtons();     // discard presses made during the display
+}
+
+// Compare the complete input position by position and show the result
+// directly below the colors. Every correct position = 1 point.
+void cmEvaluate() {
+  bool error = false;
+  byte correctCount = 0;
+
+  for (byte i = 0; i < cmLength; i++) {
+    bool correct = (cmInput[i] == cmSequence[i]);
+    cmSetFeedbackLED(i, colors[correct ? COLOR_GREEN : COLOR_RED]);
+
+    if (correct) {
+      correctCount++;
+      cmScore++;
+    } else {
+      error = true;
+#if DEBUG
+      Serial.print(F("Position "));
+      Serial.print(i + 1);
+      Serial.print(F(": wrong - expected "));
+      Serial.print(COLOR_NAMES[cmSequence[i]]);
+      Serial.print(F(", entered "));
+      Serial.println(COLOR_NAMES[cmInput[i]]);
+#endif
+    }
+  }
+  matrix.show();
+
+#if DEBUG
+  Serial.print(F("Evaluation: "));
+  Serial.print(correctCount);
+  Serial.print(F(" / "));
+  Serial.print(cmLength);
+  Serial.print(F(" correct -> score "));
+  Serial.println(cmScore);
+#endif
+
+  delay(RESULT_PAUSE);
+
+  if (error) startEndScreen(S_CM_GAME_OVER);
+  else       cmNextRound();
+}
+
+// Button 1 was pressed during the input
+void cmConfirmBlock() {
+  if (!cmInputConfirmable()) {
+#if DEBUG
+    Serial.println(cmWaitForEmpty
+      ? F("Button ignored (remove the chips of the last block first)")
+      : F("Button ignored (block incomplete)"));
+#endif
+    return;
+  }
+
+  // Chip lock: one more complete round with a fresh power test (see
+  // mmConfirmAttempt)
+  if (CHIP_LOCK && pollReaders(true)) {
+    restartBlink();
+    fetchButton(BUTTON_CONFIRM);   // discard presses during the check
+#if DEBUG
+    Serial.println(F("Button ignored (input changed during the check)"));
+#endif
+    return;
+  }
+  if (!cmInputConfirmable()) return;
+
+  // Store the block and leave it fixed (not blinking) on the grid.
+  // It is NOT evaluated yet.
+  byte size = cmBlockSize();
+  for (byte i = 0; i < size; i++) {
+    cmInput[cmInputPosition + i] = readerColor[i];
+    cmSetGridLED(cmInputPosition + i, colors[readerColor[i]]);
+  }
+  matrix.show();
+
+#if DEBUG
+  Serial.print(F("Block "));
+  Serial.print(cmInputPosition / READER_COUNT + 1);
+  Serial.print(F(": "));
+  reportSequence(cmInput + cmInputPosition, size);
+  Serial.print(F("-> "));
+  Serial.print(cmInputPosition + size);
+  Serial.print(F(" / "));
+  Serial.println(cmLength);
+#endif
+
+  cmInputPosition += size;
+  cmWaitForEmpty = true;   // chips have to be removed before the next block
+
+  if (cmInputPosition >= cmLength) {
+    cmEvaluate();
+    return;
+  }
+
+  // Next row: immediately shows the chips present (not blinking,
+  // since they have to be removed first)
+  restartBlink();
+}
+
+// Still image: score (green)
+void cmDrawEndImage() {
+  matrix.fillScreen(0);
+  drawNumber(cmScore, TEXT_Y, colors[COLOR_GREEN]);
+  matrix.show();
+}
+
+// =============================== Screens =================================
+
+// Start screen of a game (S_MM_START or S_CM_START)
+void startStartScreen(byte startState) {
+  state = startState;
+  scrollX = 16;
+  discardButtons();
+
+#if DEBUG
+  Serial.println(state == S_MM_START
+    ? F("Selected game: Mastermind")
+    : F("Selected game: Color Memory Game"));
+#endif
+}
+
+// End screen (S_MM_WON, S_MM_LOST or S_CM_GAME_OVER)
+void startEndScreen(byte endState) {
+  state = endState;
+  scrollX = 16;
+  endImageActive = false;
+  discardButtons();   // discard presses during the result pause
+
+#if DEBUG
+  if (state == S_MM_WON) {
+    Serial.println(F("*** WON ***"));
+  } else if (state == S_MM_LOST) {
+    Serial.println(F("*** LOST ***"));
+  } else {
+    Serial.print(F("*** GAME OVER *** Score: "));
+    Serial.println(cmScore);
+  }
+#endif
+}
+
+// Still image of the current end screen
+void drawEndImage() {
+  if (state == S_CM_GAME_OVER) cmDrawEndImage();
+  else                         mmDrawEndImage();
+}
+
+// Button 2 / 3 on a start or end screen: show the start screen of the
+// selected game. Returns true if a game was selected.
+bool selectGame() {
+  if (fetchButton(BUTTON_MASTERMIND)) {
+    startStartScreen(S_MM_START);
+    return true;
+  }
+  if (fetchButton(BUTTON_COLOR_MEMORY)) {
+    startStartScreen(S_CM_START);
+    return true;
+  }
+  return false;
+}
+
+// During a running game a short press of button 2 / 3 is ignored (the
+// press is discarded, so it does not act later on the end screen)
+void ignoreSelectButtons() {
+  if (fetchButton(BUTTON_MASTERMIND) | fetchButton(BUTTON_COLOR_MEMORY)) {   // | : fetch both
+#if DEBUG
+    Serial.println(F("Game selection ignored (game running - hold the button to quit)"));
+#endif
+  }
+}
+
+// Called in every running game state. Short presses of button 2 / 3 are
+// ignored; holding one of them for ABORT_HOLD_TIME quits the game and shows
+// the start screen of the selected game. Returns true if the game was quit.
+bool checkAbort() {
+  ignoreSelectButtons();
+
+  byte startState;
+  if (buttonHeld(BUTTON_MASTERMIND))        startState = S_MM_START;
+  else if (buttonHeld(BUTTON_COLOR_MEMORY)) startState = S_CM_START;
+  else return false;
+
+#if DEBUG
+  Serial.println(F("*** Game quit (button held) ***"));
+#endif
+  cancelHolds();   // the button is still down: it must not count again
+  startStartScreen(startState);
+  return true;
+}
+
+// =============================== States ==================================
+
+// S_MM_START, S_CM_START
+void loopStart() {
+  if (selectGame()) return;
+
+  bool mastermind = (state == S_MM_START);
+
+  if (fetchButton(BUTTON_CONFIRM)) {
+    if (mastermind) mmNewGame();
+    else            cmNewGame();
+    return;
+  }
+  scrollTextStep(mastermind ? TEXT_MM_START : TEXT_CM_START, NULL);   // colorful
+}
+
+// S_MM_GAME
+void mmLoopGame() {
+  if (checkAbort()) return;
+
+  if (pollReaders(false)) {
+    restartBlink();   // start visible after every change
+  }
+
+  if (fetchButton(BUTTON_CONFIRM)) {
+    mmConfirmAttempt();
     return;
   }
 
   delay(POLL_INTERVAL);
 }
 
+// S_CM_SHOW: dark pause, then the whole sequence for cmShowDuration()
+void cmLoopShow() {
+  if (checkAbort()) return;
+
+  if (!cmSequenceVisible) {
+    if (millis() - cmShowSince >= CM_SHOW_PAUSE) {
+      for (byte i = 0; i < cmLength; i++) {
+        cmSetGridLED(i, colors[cmSequence[i]]);
+      }
+      matrix.show();
+      cmSequenceVisible = true;
+      cmShowSince = millis();
+    }
+  } else if (millis() - cmShowSince >= cmShowDuration()) {
+    cmStartInput();
+  }
+}
+
+// S_CM_INPUT
+void cmLoopInput() {
+  if (checkAbort()) return;
+
+  bool changed = pollReaders(false);
+
+  // Chips of the last block removed -> the next block may be confirmed
+  if (cmWaitForEmpty && cmBlockReadersEmpty()) {
+    cmWaitForEmpty = false;
+    changed = true;
+#if DEBUG
+    Serial.println(F("Readers empty - next block can be entered"));
+#endif
+  }
+
+  if (changed) {
+    restartBlink();   // start visible after every change
+  }
+
+  if (fetchButton(BUTTON_CONFIRM)) {
+    cmConfirmBlock();
+    return;
+  }
+
+  delay(POLL_INTERVAL);
+}
+
+// S_MM_WON, S_MM_LOST, S_CM_GAME_OVER:
+// alternates between the scrolling text and the end image
 void loopEnd() {
-  if (fetchButton()) {
-    newGame();
+  if (selectGame()) return;
+
+  if (fetchButton(BUTTON_CONFIRM)) {
+    if (state == S_CM_GAME_OVER) cmNewGame();
+    else                         mmNewGame();
     return;
   }
 
   if (!endImageActive) {
-    bool won = (state == S_WON);
-    bool done = scrollTextStep(
-      won ? TEXT_WIN : TEXT_LOSE,
-      won ? colors[COLOR_GREEN] : colors[COLOR_RED]
-    );
-    if (done) {
+    const char* text  = TEXT_CM_GAME_OVER;
+    const byte* color = colors[COLOR_RED];
+    if (state == S_MM_WON) {
+      text  = TEXT_MM_WIN;
+      color = colors[COLOR_GREEN];
+    } else if (state == S_MM_LOST) {
+      text  = TEXT_MM_LOSE;
+    }
+
+    if (scrollTextStep(text, color)) {
       endImageActive = true;
       endImageSince = millis();
       drawEndImage();
@@ -1334,7 +1901,7 @@ void loopEnd() {
 void setup() {
 #if DEBUG
   Serial.begin(9600);
-  Serial.println(F("=== Mastermind ==="));
+  Serial.println(F("=== RFID Games: Mastermind + Color Memory Game ==="));
 #endif
 
   // LED matrix
@@ -1344,9 +1911,15 @@ void setup() {
   matrix.fillScreen(0);
   matrix.show();
 
-  // Button
-  pinMode(BUTTON_PIN, INPUT_PULLUP);
-  attachInterrupt(digitalPinToInterrupt(BUTTON_PIN), buttonISR, CHANGE);
+  // Buttons
+  for (byte b = 0; b < BUTTON_COUNT; b++) {
+    pinMode(BUTTON_PINS[b], INPUT_PULLUP);
+    buttonPressed[b]  = false;
+    buttonHoldUsed[b] = true;    // no hold without a press
+  }
+  attachInterrupt(digitalPinToInterrupt(BUTTON_PINS[BUTTON_CONFIRM]),      buttonConfirmISR,     CHANGE);
+  attachInterrupt(digitalPinToInterrupt(BUTTON_PINS[BUTTON_MASTERMIND]),   buttonMastermindISR,  CHANGE);
+  attachInterrupt(digitalPinToInterrupt(BUTTON_PINS[BUTTON_COLOR_MEMORY]), buttonColorMemoryISR, CHANGE);
 
   // RFID readers
   // SPI.begin() uses pins 50/51/52 on the Mega and makes pin 53 (SS) an
@@ -1389,7 +1962,7 @@ void setup() {
   checkTable();
 #endif
 
-  startStartScreen();
+  startStartScreen(S_MM_START);   // Mastermind is selected after switching on
 }
 
 void loop() {
@@ -1398,9 +1971,13 @@ void loop() {
 #endif
 
   switch (state) {
-    case S_START: loopStart(); break;
-    case S_GAME:  loopGame();  break;
-    case S_WON:
-    case S_LOST:  loopEnd();   break;
+    case S_MM_START:
+    case S_CM_START:     loopStart();   break;
+    case S_MM_GAME:      mmLoopGame();  break;
+    case S_CM_SHOW:      cmLoopShow();  break;
+    case S_CM_INPUT:     cmLoopInput(); break;
+    case S_MM_WON:
+    case S_MM_LOST:
+    case S_CM_GAME_OVER: loopEnd();     break;
   }
 }

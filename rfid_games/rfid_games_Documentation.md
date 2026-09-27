@@ -210,12 +210,6 @@ chips are detected unreliably, increase `ANTENNA_WAIT` first.
 
 ### Range of the readers: gain and transmitter power
 
-The four readers lie only about **3 mm** apart. In addition, some readers
-do not lie completely flat, because the pins on their back lift them up on
-one side. A tilted reader has a different distance to the chip than its
-neighbors, and its field reaches further to one side. Both make it easy for
-a chip to be detected by a neighboring reader as well.
-
 If a chip is also detected by a neighboring reader, the range of the
 readers can be reduced with two settings. Both are applied to all four
 readers.
@@ -238,9 +232,9 @@ step (step 8 → `0x20` / `0x8` = reset values). The field does not drop
 linearly: neighboring steps may hardly differ, and below a certain step
 detection stops abruptly.
 
-How far the range actually drops depends on the module, its antenna and
-how flat it lies, so the right combination has to be found by testing. For
-this, both values can be changed at runtime via the Serial Monitor (`DEBUG 1`, 9600 baud),
+How far the range actually drops depends on the module and its antenna, so
+the right combination has to be found by testing. For this, both values
+can be changed at runtime via the Serial Monitor (`DEBUG 1`, 9600 baud),
 without uploading the sketch again. This works in every state of both
 games:
 
@@ -658,14 +652,7 @@ On the Mega the interrupt-capable pins are D2, D3, D18, D19, D20 and D21.
 `attachInterrupt(digitalPinToInterrupt(pin), …)` translates the pin number
 into the right interrupt number itself, so nothing has to be changed in the
 code if a button is moved to another of these pins – only its entry in
-`BUTTON_PINS[]`. The Arduino interrupt number and the interrupt of the
-ATmega2560 itself are not the same:
-
-| Button | Pin | Arduino interrupt | ATmega2560 interrupt |
-|---|---|---|---|
-| Button 1 | D2 | 0 | INT4 |
-| Button 2 | D3 | 1 | INT5 |
-| Button 3 | D18 | 5 | INT3 |
+`BUTTON_PINS[]`.
 
 ### Why is the Color Memory display a separate state?
 
@@ -684,10 +671,8 @@ evaluation (`RESULT_PAUSE`) still use `delay()`, as before in Mastermind.
   game.
 - **Memory:** The Mega has 8 KB of RAM (the UNO only 2 KB), of which the
   matrix occupies 768 bytes. The chip table (`CHIPS[]`) and all texts still
-  live in flash (`PROGMEM`) instead of in RAM. On the Mega this is no longer
-  strictly necessary, but it costs nothing and leaves RAM free for later
-  extensions. Already-played Mastermind attempts are not stored separately
-  – they are on the matrix anyway. The
+  live in flash (`PROGMEM`) instead of in RAM. Already-played Mastermind
+  attempts are not stored separately – they are on the matrix anyway. The
   Color Memory Game needs two arrays of `CM_MAX_LENGTH` bytes (sequence and
   input), because the input is only evaluated at the end.
 
@@ -705,21 +690,7 @@ because it does not yet include the matrix buffer – that is only allocated
 at runtime. Depending on the compiler version of the IDE, the flash values
 can differ by a few hundred bytes (the Mastermind-only sketch measured
 23 232 bytes with this compiler, 23 780 bytes in the IDE). With more than
-6 KB of free RAM there is plenty of room for the stack and for extensions
-(e.g. more readers, sound).
-
-The chip lock alone needs about 3 KB of flash and about 100 bytes of RAM.
-For comparison, the Mastermind-only sketch (`mastermind.ino`, measured in
-the IDE):
-
-| Variant | Flash (of 248 KB) | RAM (incl. 768-byte matrix buffer at runtime) |
-|---|---|---|
-| `DEBUG 1` | 23 780 bytes ≈ 9 % | 1 568 bytes ≈ 19 % |
-| `DEBUG 0` | 20 530 bytes ≈ 8 % | 1 513 bytes ≈ 18 % |
-
-Compared with the same compiler (`DEBUG 1`: 26 986 vs. 23 232 bytes), the
-Color Memory Game and the game selection add about 3.7 KB of flash and about
-100 bytes of RAM.
+6 KB of free RAM there is plenty of room for the stack and for extensions.
 
 ---
 
@@ -728,7 +699,7 @@ Color Memory Game and the game selection add about 3.7 KB of flash and about
 The complete schematic is in `mastermind.kicad_sch`. In the sketch, the pins
 are defined at the top under *Pins*.
 
-![Schematic – Arduino Mega 2560 version](/mastermind_kicad/mastermind_schematic.png)
+![Schematic – Arduino Mega 2560 version](/kicad/mastermind_schematic.png)
 
 ### Pin assignment
 
@@ -807,9 +778,6 @@ For everyone who knows `mastermind.ino` or `Color-Memory-Game.ino`:
 
 **Both games**
 
-- Button 2 (D3) and button 3 (D18) were only reserved in the Mastermind
-  wiring and not used by the firmware. They now select the game and quit a
-  running game. The wiring itself did not change.
 - A running game can be quit by holding button 2 or 3 for 3 s (new; before
   there was no way out of a running game except a reset).
 
