@@ -222,47 +222,101 @@ neighbors, and its field reaches further to one side. Both make it easy for
 a chip to be detected by a neighboring reader as well.
 
 If a chip is also detected by a neighboring reader, the range of the
-readers can be reduced with two settings. Both are applied to all four
-readers.
+readers can be reduced with two settings. Because the modules differ, both
+are set **individually for every reader**: each constant is an array with
+one entry per reader (reader 1 first).
 
-`RFID_GAIN_STEP` (default `2`) sets the receiver gain, i.e. how well the
-reader "hears" the answer of a chip. The RC522 only knows these six values,
-there are no steps in between:
+| Constant | Default | Meaning |
+|---|---|---|
+| `RFID_GAIN_STEP[]` | `{ 2, 2, 1, 1 }` | Receiver gain per reader, step `0`–`5` |
+| `TX_POWER_STEP[]` | `{ 2, 1, 1, 2 }` | Transmitter power per reader, step `1`–`8` |
+| `PROBE_GAIN_STEP` | `2` | Gain of all readers during the power test of the chip lock (see [Chip lock](#chip-lock)) |
+| `FALLBACK_MIN_GAIN_STEP` | `0` | Lowest gain step for a repeated read after a read error (see [Read errors](#read-errors-reading-again-with-less-gain)) |
+
+All values are checked at compile time: an entry outside its allowed range
+stops the compilation with an error message.
+
+`RFID_GAIN_STEP` sets the receiver gain, i.e. how well the reader "hears"
+the answer of a chip. The RC522 only knows these six values, there are no
+steps in between:
 
 | Step | 0 | 1 | 2 | 3 | 4 | 5 |
 |---|---|---|---|---|---|---|
 | Gain | 18 dB | 23 dB | 33 dB (library default) | 38 dB | 43 dB | 48 dB |
 
-`TX_POWER_STEP` (default `4`, allowed `1`–`8`) sets the transmitter power,
-i.e. the strength of the field itself. A weaker field means a chip on a
-neighboring reader is no longer powered at all, which usually works better
-than a lower gain. Step 8 is the library default (full power). The MFRC522
-library has no function for this; the sketch writes the driver conductance
-registers directly: `CWGsPReg` = step × 4 and the upper half of `GsNReg` =
-step (step 8 → `0x20` / `0x8` = reset values). The field does not drop
-linearly: neighboring steps may hardly differ, and below a certain step
-detection stops abruptly.
+`TX_POWER_STEP` sets the transmitter power, i.e. the strength of the field
+itself. A weaker field means a chip on a neighboring reader is no longer
+powered at all, which usually works better than a lower gain. Step 8 is the
+library default (full power). The MFRC522 library has no function for this;
+the sketch writes the driver conductance registers directly: `CWGsPReg` =
+step × 4 and the upper half of `GsNReg` = step (step 8 → `0x20` / `0x8` =
+reset values). The field does not drop linearly: neighboring steps may
+hardly differ, and below a certain step detection stops abruptly.
 
 How far the range actually drops depends on the module, its antenna and
-how flat it lies, so the right combination has to be found by testing. For
-this, both values can be changed at runtime via the Serial Monitor (`DEBUG 1`, 9600 baud),
-without uploading the sketch again. This works in every state of both
-games:
+how flat it lies, so the right combination has to be found by testing. The
+default values were determined with the separate test sketch
+`rfid_sweep_test.ino` (block "RECOMMENDED SETTINGS" in its output). Repeat
+this test after changing the hardware – a module swapped, readers moved,
+other chips – and enter the recommended values in `RFID_GAIN_STEP` and
+`TX_POWER_STEP`.
 
-| Input | Effect |
-|---|---|
-| `g0` … `g5` | set gain step |
-| `t1` … `t8` | set transmitter power step |
-| `?` | show current settings |
+For fine-tuning, all values can also be changed at runtime via the Serial
+Monitor (`DEBUG 1`, 9600 baud), without uploading the sketch again. This
+works in every state of both games. A command consists of the letter, the
+reader (`0` = all readers, `1`–`4` = one reader) and the step:
 
-After every change the values read back from each reader are printed
-(gain `0x00`/`0x10`/`0x40`/…, `CWGsP` = step × 4, `GsN` with the step in the
-upper digit). If a reader shows different values, it did not accept the
-setting. Recommended procedure: for each setting, first check that chips
-lying directly on each reader are still detected, then check that a chip on
-one reader no longer appears on its neighbor. Enter the combination found
-in `RFID_GAIN_STEP` and `TX_POWER_STEP` – changes made via serial are lost
+| Input | Effect | Example |
+|---|---|---|
+| `g<reader><step>` | set gain step `0`–`5` | `g24` = reader 2 → 43 dB, `g01` = all readers → 23 dB |
+| `t<reader><step>` | set transmitter power step `1`–`8` | `t38` = reader 3 → step 8, `t02` = all readers → step 2 |
+| `?` | show current settings | |
+
+After every change the settings of all readers are printed, together with
+the values read back from each reader (gain `0x00`/`0x10`/`0x40`/…,
+`CWGsP` = step × 4, `GsN` with the step in the upper digit), the gain used
+for the power test and finally the current values in the form of the
+constants, e.g.
+
+```
+RFID settings:
+  Reader 1: gain step 2 (33 dB), TX step 2  | gain 0x40 | CWGsP 0x8 | GsN 0x28
+  ...
+  Power test: gain step 2 (33 dB) on all readers, TX steps 1..8
+  constexpr byte RFID_GAIN_STEP[READER_COUNT] = { 2, 2, 1, 1 };
+  constexpr byte TX_POWER_STEP[READER_COUNT]  = { 2, 1, 1, 2 };
+```
+
+If a reader shows different register values than expected, it did not
+accept the setting. Recommended procedure: for each setting, first check
+that chips lying directly on each reader are still detected, then check
+that a chip on one reader no longer appears on its neighbors. Copy the two
+last lines of the output into the sketch – changes made via serial are lost
 after a restart.
+
+### Read errors: reading again with less gain
+
+A typical problem with readers this close together: the own chip lies on
+the reader, and at the same time a chip on the neighboring reader answers
+weakly. With high gain the reader hears both answers, they overlap and the
+answer can no longer be decoded. Without a countermeasure the reader would
+report *no* chip – the own chip would disappear as long as the neighbor
+chip lies there.
+
+`readReader()` therefore distinguishes between "no chip answers" (timeout,
+normal) and "a chip answers, but the answer is garbled" (read error). After
+a read error, the reader immediately reads again with less gain, one step
+at a time down to `FALLBACK_MIN_GAIN_STEP` (default `0` = 18 dB), until the
+read is clean. The weak neighbor chip drops below the receiver threshold
+first, while the own chip directly on the antenna is still read. Afterwards
+the normal gain of the reader is restored. If no step reads cleanly, the
+read with the most chips is used.
+
+With `DEBUG 1` a line is printed only when the state of a reader changes,
+e.g. `Reader 2: read error at 33 dB -> clean read at 23 dB`,
+`Reader 2: read error, also with less gain` or
+`Reader 2: reads normally again`. If a reader frequently needs the fallback,
+its normal gain is probably too high.
 
 ### Active readers
 
@@ -311,15 +365,25 @@ runs in three steps:
      cross-read).
    - *Power test:* if a chip is still seen by several free readers, the
      transmitter power of each of them is lowered step by step (binary
-     search, 3–4 reads per reader). The reader that still sees the chip at
-     the lowest step is closest and gets it. The result is remembered for
+     search over steps 1–8, 4 reads per reader). The reader that still sees
+     the chip at the lowest step is closest and gets it. Because the normal
+     settings differ from reader to reader, the power test does **not** use
+     them: every reader is measured with the same gain `PROBE_GAIN_STEP`
+     (default `2` = 33 dB) over the same range 1–8, so the results of
+     different readers can be compared. Afterwards each reader gets its
+     normal gain and transmitter power back. The result is remembered for
      `PROBE_CACHE_TIME` (default 3000 ms) as long as the same readers
      compete, so the test does not run in every round.
    - If several chips can only belong to the same reader, it keeps the chip
      it already shows; otherwise the power test decides here as well.
-   - *In case of doubt white:* on a tie nobody gets the chip. The affected
-     reader shows white, the row does not blink and cannot be confirmed –
-     the player sees the problem and straightens the chip.
+   - *Tie:* if several readers reach the same lowest step, the reader that
+     already shows this chip keeps it, so a tie does not make a displayed
+     chip vanish. The same applies if several chips on one reader tie: the
+     chip the reader already shows stays.
+   - *In case of doubt white:* if none of the tied readers shows the chip
+     yet, nobody gets it. The affected reader shows white, the row does not
+     blink and cannot be confirmed – the player sees the problem and
+     straightens the chip.
 
    The reader that currently shows a chip stays a candidate for it even if
    it missed it in this round, so a single dropout does not hand the chip
@@ -337,14 +401,20 @@ wrong color can therefore never be confirmed.
 With `DEBUG 1` every power test is printed, e.g.
 `Chip 04 99 32 BB seen by readers 1+2 -> power test: R1=4 R2=1 -> reader 2`
 (the number is the lowest step at which the reader still saw the chip,
-`-` = not at all). This also shows how clearly the readers can be told
-apart: if the numbers are far apart, the setting is good; if they are
-often equal, lower the transmitter power a little further.
+`-` = not at all). A tie that is resolved in favor of the current reader
+appears as `-> tie, reader 1 keeps it`, an undecided one as
+`-> undecided, nobody`. This also shows how clearly the readers can be
+told apart: if the numbers are far apart, the readers are well separated;
+if they are often equal, try a different `PROBE_GAIN_STEP`. Since the
+power test always uses its own settings, changing `RFID_GAIN_STEP` /
+`TX_POWER_STEP` does not change these numbers.
 
 **Cost:** a reader with a chip needs one extra request per round (about
 25 ms timeout), so a round with all four readers occupied takes roughly
 100 ms longer. A power test takes a few hundred milliseconds, during which
-blinking may stutter briefly. `CHIP_LOCK = false` restores the old
+blinking may stutter briefly. The repeated reads after a read error (see
+above) only cost time when an error actually occurs – at most one extra
+read per gain step below the normal one. `CHIP_LOCK = false` restores the old
 behavior (every reader shows the first chip it sees) for comparison.
 
 ### First-time setup: filling the chip table
@@ -589,17 +659,28 @@ helpers*, *Mastermind*, *Color Memory Game*, *Screens*, *States*,
 
 **RFID**
 
-- `readAllChips(reader, uids)` – polls a single reader and reads all chips
-  in its field (with `CHIP_LOCK = false` only the first). Only the antenna
-  of the reader currently being polled is ever active; this prevents mutual
-  interference and relieves the 3.3 V regulator.
+- `readAllChips(reader, uids, error)` – polls a single reader and reads all
+  chips in its field (with `CHIP_LOCK = false` only the first). Only the
+  antenna of the reader currently being polled is ever active; this
+  prevents mutual interference and relieves the 3.3 V regulator. `error`
+  is set if a chip answered but the answer could not be decoded (no answer
+  at all is not an error).
+- `readReader(i, uids)` – reads reader `i` via `readAllChips()` and repairs
+  read errors by reading again with less gain (down to
+  `FALLBACK_MIN_GAIN_STEP`). Used by `pollReaders()`.
+- `noteFallback(i, state)` – (only with `DEBUG 1`) prints a line when the
+  read-error state of a reader changes.
 - `setTxPower(i, step)` – sets the transmitter power of one reader.
 - `findColor(uid)` – looks up the UID in the chip table and returns the color
   index (unknown → 0 = White).
-- `applyRfidSettings()` – writes the current gain and transmitter power
-  step to all four readers.
-- `serialTuning()` – (only with `DEBUG 1`) reads the commands `g0`–`g5`,
-  `t1`–`t8` and `?` from the Serial Monitor.
+- `applyReaderSettings(i)` – writes the gain and transmitter power of
+  reader `i` (`gainStep[i]` / `txStep[i]`).
+- `applyRfidSettings()` – writes the settings of all four readers.
+- `reportRfidSettings()` – prints the settings of every reader, the
+  registers read back and the values in the form of the constants
+  (`printStepArray()`).
+- `serialTuning()` – (only with `DEBUG 1`) reads the commands
+  `g<reader><step>`, `t<reader><step>` and `?` from the Serial Monitor.
 - `pollReaders(fresh)` – one complete round: read all active readers,
   assign the chips, update the display state. Inactive readers are skipped
   and forget their chip. Returns `true` if a displayed color has
@@ -613,11 +694,14 @@ helpers*, *Mastermind*, *Color Memory Game*, *Screens*, *States*,
 - `resolveOwners(owner, fresh)` – assigns every chip seen in the round to
   at most one reader (elimination, then power test).
 - `decideContested(uid, mask, fresh)` – power test for a chip seen by
-  several readers, with the remembered results (`probeCache`).
+  several readers, with the remembered results (`probeCache`). On a tie
+  the reader that already shows the chip keeps it.
 - `decideOnReader(...)` – several chips that can only belong to the same
-  reader: keep the current one, otherwise power test.
+  reader: keep the current one, otherwise power test (on a tie, too, the
+  current chip stays).
 - `probeThreshold(i, uid)` – lowest transmitter power step at which reader
-  `i` still sees the chip (binary search).
+  `i` still sees the chip (binary search over 1–8 with `PROBE_GAIN_STEP`),
+  then restores the normal settings of the reader.
 
 **Display**
 
@@ -704,10 +788,10 @@ Measured with Arduino AVR core 1.8.6 and avr-gcc 7.3.0:
 
 | Variant | Flash (of 248 KB) | RAM (incl. 768-byte matrix buffer at runtime) |
 |---|---|---|
-| `DEBUG 1` | 26 986 bytes ≈ 10 % | 1 669 bytes ≈ 20 % |
-| `DEBUG 0` | 22 762 bytes ≈ 9 % | 1 612 bytes ≈ 20 % |
+| `DEBUG 1` | 28 418 bytes ≈ 11 % | 1 679 bytes ≈ 20 % |
+| `DEBUG 0` | 23 414 bytes ≈ 9 % | 1 626 bytes ≈ 20 % |
 
-The RAM figure reported by the Arduino IDE is lower (901 resp. 844 bytes)
+The RAM figure reported by the Arduino IDE is lower (911 resp. 858 bytes)
 because it does not yet include the matrix buffer – that is only allocated
 at runtime. Depending on the compiler version of the IDE, the flash values
 can differ by a few hundred bytes (the Mastermind-only sketch measured
@@ -724,9 +808,12 @@ the IDE):
 | `DEBUG 1` | 23 780 bytes ≈ 9 % | 1 568 bytes ≈ 19 % |
 | `DEBUG 0` | 20 530 bytes ≈ 8 % | 1 513 bytes ≈ 18 % |
 
-Compared with the same compiler (`DEBUG 1`: 26 986 vs. 23 232 bytes), the
-Color Memory Game and the game selection add about 3.7 KB of flash and about
-100 bytes of RAM.
+Compared with the same compiler (`DEBUG 1`: 26 986 vs. 23 232 bytes before
+the per-reader settings), the Color Memory Game and the game selection add
+about 3.7 KB of flash and about 100 bytes of RAM. The per-reader gain and
+transmitter power, the repeated read after read errors and the tie rule of
+the power test add about 1.5 KB of flash with `DEBUG 1` (most of it serial
+output) resp. 0.7 KB with `DEBUG 0`, and 10–14 bytes of RAM.
 
 ---
 

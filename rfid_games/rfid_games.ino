@@ -204,31 +204,62 @@ const unsigned int POLL_INTERVAL = 30;
 // If chips are detected unreliably: increase this first (e.g. to 10).
 const byte ANTENNA_WAIT = 5;
 
-// Receiver gain of all 4 readers (step 0..5). Lower = shorter range.
+// Gain and transmitter power are set INDIVIDUALLY for every reader, because
+// the modules differ. The values were found with rfid_sweep_test.ino
+// (block "RECOMMENDED SETTINGS"); repeat the test after changing the
+// hardware (module swapped, readers moved, other chips).
+
+// Receiver gain per reader (step 0..5). Lower = shorter range.
 // The RC522 only knows these 6 values, there are no steps in between:
 //   step:   0      1      2      3      4      5
 //   gain:  18 dB  23 dB  33 dB  38 dB  43 dB  48 dB
 //                        ^ library default after PCD_Init()
-const byte RFID_GAIN_STEP = 2;
+//                                     reader:  1  2  3  4
+constexpr byte RFID_GAIN_STEP[READER_COUNT] = { 2, 2, 1, 1 };
 
-// Transmitter power of all 4 readers (step 1..8), i.e. the strength of the
-// field itself. Step 8 = library default (full power).
+// Transmitter power per reader (step 1..8), i.e. the strength of the field
+// itself. Step 8 = library default (full power).
 // The library has no function for this, so the driver conductance registers
 // are written directly: CWGsP = step * 4, CWGsN = step
 // (step 8 -> 0x20 / 0x8 = reset values, step 4 -> 0x10 / 0x4, ...).
 // The field does not drop linearly: neighboring steps may hardly differ,
 // below a certain step detection stops abruptly.
-const byte TX_POWER_STEP = 4;
+//                                     reader:  1  2  3  4
+constexpr byte TX_POWER_STEP[READER_COUNT]  = { 2, 1, 1, 2 };
 
-// Both values can also be changed at runtime via the Serial Monitor
-// (DEBUG 1): "g0".."g5" = gain, "t1".."t8" = transmitter power,
-// "?" = show current settings. Enter the values found afterwards here.
+// Gain used by ALL readers during the power test of the chip lock. The test
+// then searches the transmitter power steps 1..8 on every reader, so the
+// results of different readers stay comparable although their normal
+// settings differ. Step 2 = 33 dB = library default.
+const byte PROBE_GAIN_STEP = 2;
+
+// All values can also be changed at runtime via the Serial Monitor
+// (DEBUG 1): "g<reader><step>" = gain, "t<reader><step>" = transmitter
+// power, reader 0 = all readers, "?" = show current settings.
+// Enter the values found afterwards here.
 
 const byte GAIN_STEP_COUNT = 6;
 const byte TX_STEP_MAX     = 8;
-static_assert(RFID_GAIN_STEP < GAIN_STEP_COUNT, "RFID_GAIN_STEP must be 0..5");
-static_assert(TX_POWER_STEP >= 1 && TX_POWER_STEP <= TX_STEP_MAX,
-              "TX_POWER_STEP must be 1..8");
+
+// Checks every entry of RFID_GAIN_STEP / TX_POWER_STEP at compile time
+constexpr bool rfidStepsValid(byte i) {
+  return i >= READER_COUNT ||
+         (RFID_GAIN_STEP[i] < GAIN_STEP_COUNT &&
+          TX_POWER_STEP[i] >= 1 && TX_POWER_STEP[i] <= TX_STEP_MAX &&
+          rfidStepsValid(i + 1));
+}
+static_assert(rfidStepsValid(0),
+              "RFID_GAIN_STEP must be 0..5 and TX_POWER_STEP 1..8 for every reader");
+static_assert(PROBE_GAIN_STEP < GAIN_STEP_COUNT, "PROBE_GAIN_STEP must be 0..5");
+
+// Read errors (see readReader()): if a reader gets an answer it cannot
+// decode - typically its own chip plus the weak answer of a chip on the
+// neighbor reader, which garbles it - the reader immediately reads again
+// with less gain, one step at a time down to this gain step. The weak
+// neighbor chip drops below the receiver threshold first, the own chip
+// directly on the antenna is still read. 0 = down to 18 dB.
+const byte FALLBACK_MIN_GAIN_STEP = 0;
+static_assert(FALLBACK_MIN_GAIN_STEP < GAIN_STEP_COUNT, "FALLBACK_MIN_GAIN_STEP must be 0..5");
 
 // Chip lock against cross-reading (see documentation, "Chip lock").
 // true  = every chip is assigned to exactly one reader, even if several
@@ -400,8 +431,8 @@ bool endImageActive = false;
 unsigned long endImageSince = 0;
 
 // Reader
-byte gainStep = RFID_GAIN_STEP;   // current settings (changeable via serial)
-byte txStep   = TX_POWER_STEP;
+byte gainStep[READER_COUNT];   // current settings per reader (changeable via serial),
+byte txStep[READER_COUNT];     // loaded from RFID_GAIN_STEP / TX_POWER_STEP in setup()
 byte readerColor[READER_COUNT];             // color index per reader
 byte currentUid[READER_COUNT][UID_LENGTH];  // UID of the chip currently present
 bool chipPresent[READER_COUNT];             // is a chip currently present?
@@ -597,9 +628,13 @@ void drawNumber(unsigned int value, int16_t y, const byte color[3]) {
 // read and put to sleep (HALT). REQA then only wakes chips that are not yet
 // asleep - so the next chip answers, until none is left.
 // Only the antenna of the reader being polled is on at any time.
-byte readAllChips(MFRC522 &r, byte uids[][UID_LENGTH]) {
+// error = true: a chip answered, but the answer could not be decoded
+// (garbled request answer, failed anticollision / select). The read stops
+// there. No answer at all (timeout) is not an error.
+byte readAllChips(MFRC522 &r, byte uids[][UID_LENGTH], bool &error) {
   byte count = 0;
   byte maxChips = CHIP_LOCK ? MAX_CHIPS_PER_READER : 1;
+  error = false;
 
   r.PCD_AntennaOn();
   delay(ANTENNA_WAIT);
@@ -612,8 +647,14 @@ byte readAllChips(MFRC522 &r, byte uids[][UID_LENGTH]) {
       ? r.PICC_WakeupA(atqa, &atqaSize)     // first chip: wake everything
       : r.PICC_RequestA(atqa, &atqaSize);   // further chips: only those not asleep
 
-    if (status != MFRC522::STATUS_OK && status != MFRC522::STATUS_COLLISION) break;
-    if (!r.PICC_ReadCardSerial()) break;
+    if (status != MFRC522::STATUS_OK && status != MFRC522::STATUS_COLLISION) {
+      if (status != MFRC522::STATUS_TIMEOUT) error = true;   // garbled, not "nobody there"
+      break;
+    }
+    if (!r.PICC_ReadCardSerial()) {
+      error = true;   // a chip answered, but selecting / reading its UID failed
+      break;
+    }
 
     bool duplicate = false;
     for (byte k = 0; k < count; k++) {
@@ -648,12 +689,17 @@ const byte GAIN_VALUES[GAIN_STEP_COUNT] = {
   MFRC522::RxGain_38dB, MFRC522::RxGain_43dB, MFRC522::RxGain_48dB
 };
 
-// Writes gain and transmitter power (gainStep / txStep) to all readers.
+// Writes the gain and transmitter power of reader i (gainStep[i] / txStep[i]).
+void applyReaderSettings(byte i) {
+  reader[i].PCD_SetAntennaGain(GAIN_VALUES[gainStep[i]]);
+  setTxPower(i, txStep[i]);
+}
+
+// Writes the settings of all readers.
 // Must be called after PCD_Init(), because PCD_Init() resets both.
 void applyRfidSettings() {
   for (byte i = 0; i < READER_COUNT; i++) {
-    reader[i].PCD_SetAntennaGain(GAIN_VALUES[gainStep]);
-    setTxPower(i, txStep);
+    applyReaderSettings(i);
     probeCache[i].valid = false;   // old power-test results no longer apply
   }
 }
@@ -739,56 +785,96 @@ void reportSequence(const byte* sequence, byte length) {
 
 const byte GAIN_DB[GAIN_STEP_COUNT] = { 18, 23, 33, 38, 43, 48 };
 
-// Prints the current RFID settings, read back from every reader
+// Prints a settings array in the form of the constants, e.g. "{ 4, 1, 4, 1 };"
+void printStepArray(const byte* steps) {
+  Serial.print(F("{ "));
+  for (byte i = 0; i < READER_COUNT; i++) {
+    Serial.print(steps[i]);
+    Serial.print(i < READER_COUNT - 1 ? F(", ") : F(" };"));
+  }
+  Serial.println();
+}
+
+// Prints the current RFID settings of every reader and the registers read
+// back from it, then the values in the form of the constants.
 void reportRfidSettings() {
-  Serial.print(F("RFID: gain step "));
-  Serial.print(gainStep);
-  Serial.print(F(" ("));
-  Serial.print(GAIN_DB[gainStep]);
-  Serial.print(F(" dB), transmitter power step "));
-  Serial.print(txStep);
-  Serial.println(F(" of 8"));
+  Serial.println(F("RFID settings:"));
 
   // Expected: gain 0x00/0x10/0x40/0x50/0x60/0x70, CWGsP = step*4, GsN = step in the upper digit
   for (byte i = 0; i < READER_COUNT; i++) {
     Serial.print(F("  Reader "));
     Serial.print(i + 1);
-    Serial.print(F(": gain 0x"));
+    Serial.print(F(": gain step "));
+    Serial.print(gainStep[i]);
+    Serial.print(F(" ("));
+    Serial.print(GAIN_DB[gainStep[i]]);
+    Serial.print(F(" dB), TX step "));
+    Serial.print(txStep[i]);
+    Serial.print(F("  | gain 0x"));
     Serial.print(reader[i].PCD_GetAntennaGain(), HEX);
     Serial.print(F(" | CWGsP 0x"));
     Serial.print(reader[i].PCD_ReadRegister(MFRC522::CWGsPReg), HEX);
     Serial.print(F(" | GsN 0x"));
     Serial.println(reader[i].PCD_ReadRegister(MFRC522::GsNReg), HEX);
   }
+  Serial.print(F("  Power test: gain step "));
+  Serial.print(PROBE_GAIN_STEP);
+  Serial.print(F(" ("));
+  Serial.print(GAIN_DB[PROBE_GAIN_STEP]);
+  Serial.println(F(" dB) on all readers, TX steps 1..8"));
+
+  Serial.print(F("  constexpr byte RFID_GAIN_STEP[READER_COUNT] = "));
+  printStepArray(gainStep);
+  Serial.print(F("  constexpr byte TX_POWER_STEP[READER_COUNT]  = "));
+  printStepArray(txStep);
 }
 
-// Change gain / transmitter power at runtime via the Serial Monitor:
-//   g0..g5 = gain step, t1..t8 = transmitter power step, ? = show settings
+// Change gain / transmitter power at runtime via the Serial Monitor.
+// Command letter, reader (0 = all readers, 1..4), step:
+//   g<reader><step>  gain step 0..5,               e.g. g24 = reader 2 -> 43 dB
+//   t<reader><step>  transmitter power step 1..8,  e.g. t38 = reader 3 -> step 8
+//   ?                show settings
 void serialTuning() {
   static char command = 0;
+  static byte target  = NO_READER;   // first digit after the letter
 
   while (Serial.available()) {
     char c = Serial.read();
 
     if (c == 'g' || c == 'G' || c == 't' || c == 'T') {
       command = tolower(c);
+      target  = NO_READER;
     } else if (c == '?') {
       reportRfidSettings();
       command = 0;
     } else if (c >= '0' && c <= '9' && command != 0) {
       byte value = c - '0';
-      if (command == 'g' && value < GAIN_STEP_COUNT) {
-        gainStep = value;
-        applyRfidSettings();
-        reportRfidSettings();
-      } else if (command == 't' && value >= 1 && value <= TX_STEP_MAX) {
-        txStep = value;
-        applyRfidSettings();
-        reportRfidSettings();
+      bool valid;
+
+      if (target == NO_READER) {
+        // First digit: the reader
+        valid = (value <= READER_COUNT);
+        if (valid) target = value;
       } else {
-        Serial.println(F("Invalid value (g0..g5, t1..t8)"));
+        // Second digit: the step
+        valid = (command == 'g') ? (value < GAIN_STEP_COUNT)
+                                 : (value >= 1 && value <= TX_STEP_MAX);
+        if (valid) {
+          for (byte i = 0; i < READER_COUNT; i++) {
+            if (target != 0 && target != i + 1) continue;
+            if (command == 'g') gainStep[i] = value;
+            else                txStep[i]   = value;
+          }
+          applyRfidSettings();
+          reportRfidSettings();
+        }
+        command = 0;
       }
-      command = 0;
+
+      if (!valid) {
+        Serial.println(F("Invalid input (g<reader 0..4><step 0..5>, t<reader 0..4><step 1..8>, ?)"));
+        command = 0;
+      }
     }
     // everything else (line endings etc.) is ignored
   }
@@ -898,11 +984,85 @@ bool sawUid(byte i, const byte* uid) {
   return false;
 }
 
+// ---------------------- Read errors: less gain --------------------------
+
+const byte FALLBACK_NONE   = 0xFF;   // read without error at the normal gain
+const byte FALLBACK_FAILED = 0xFE;   // error even at the lowest gain step
+
+#if DEBUG
+byte fallbackState[READER_COUNT];    // last state per reader (set in setup)
+#endif
+
+// Prints a line when the read-error state of reader i changes, so the
+// Serial Monitor is not flooded every round.
+void noteFallback(byte i, byte state) {
+#if DEBUG
+  if (fallbackState[i] == state) return;
+  fallbackState[i] = state;
+  Serial.print(F("Reader "));
+  Serial.print(i + 1);
+  if (state == FALLBACK_NONE) {
+    Serial.println(F(": reads normally again"));
+  } else if (state == FALLBACK_FAILED) {
+    Serial.println(F(": read error, also with less gain"));
+  } else {
+    Serial.print(F(": read error at "));
+    Serial.print(GAIN_DB[gainStep[i]]);
+    Serial.print(F(" dB -> clean read at "));
+    Serial.print(GAIN_DB[state]);
+    Serial.println(F(" dB"));
+  }
+#else
+  (void)i;
+  (void)state;
+#endif
+}
+
+// Reads reader i like readAllChips(), but repairs read errors.
+// Typical cause: the own chip lies on the reader and a chip on the neighbor
+// reader answers weakly at the same time. With high gain the reader hears
+// both, the answer is garbled and the reader would report NO chip - the own
+// chip would disappear as long as the neighbor chip lies there.
+// Then the reader reads again with less gain, one step at a time down to
+// FALLBACK_MIN_GAIN_STEP, until the read is clean. The weak neighbor chip
+// drops below the receiver threshold first, the own chip is still read.
+// The normal gain is restored afterwards. Result: the clean read, otherwise
+// the read with the most chips.
+byte readReader(byte i, byte uids[][UID_LENGTH]) {
+  bool error;
+  byte count = readAllChips(reader[i], uids, error);
+  if (!error) {
+    noteFallback(i, FALLBACK_NONE);
+    return count;
+  }
+
+  byte retry[MAX_CHIPS_PER_READER][UID_LENGTH];
+  byte state = FALLBACK_FAILED;
+
+  for (int8_t g = (int8_t)gainStep[i] - 1; g >= (int8_t)FALLBACK_MIN_GAIN_STEP; g--) {
+    reader[i].PCD_SetAntennaGain(GAIN_VALUES[g]);
+    byte retryCount = readAllChips(reader[i], retry, error);
+    if (retryCount > count || (!error && retryCount == count)) {
+      memcpy(uids, retry, retryCount * UID_LENGTH);
+      count = retryCount;
+    }
+    if (!error) {
+      state = g;
+      break;
+    }
+  }
+
+  reader[i].PCD_SetAntennaGain(GAIN_VALUES[gainStep[i]]);   // normal gain again
+  noteFallback(i, state);
+  return count;
+}
+
 // Does reader i see the UID at transmitter power step "step"?
 bool seesUidAt(byte i, const byte* uid, byte step) {
   byte uids[MAX_CHIPS_PER_READER][UID_LENGTH];
+  bool error;   // not used here: in the power test a read error = not seen
   setTxPower(i, step);
-  byte count = readAllChips(reader[i], uids);
+  byte count = readAllChips(reader[i], uids, error);
   for (byte k = 0; k < count; k++) {
     if (memcmp(uids[k], uid, UID_LENGTH) == 0) return true;
   }
@@ -910,12 +1070,16 @@ bool seesUidAt(byte i, const byte* uid, byte step) {
 }
 
 // Power test: lowest transmitter power step at which reader i still sees
-// the chip (binary search, 3-4 reads). NO_THRESHOLD = not seen at all.
+// the chip (binary search, 4 reads). NO_THRESHOLD = not seen at all.
+// Every reader is measured with the same gain (PROBE_GAIN_STEP) over the
+// same range 1..TX_STEP_MAX, so the steps of different readers can be
+// compared although their normal settings differ.
 byte probeThreshold(byte i, const byte* uid) {
   byte result = NO_THRESHOLD;
 
-  if (seesUidAt(i, uid, txStep)) {
-    byte low = 1, high = txStep;
+  reader[i].PCD_SetAntennaGain(GAIN_VALUES[PROBE_GAIN_STEP]);
+  if (seesUidAt(i, uid, TX_STEP_MAX)) {
+    byte low = 1, high = TX_STEP_MAX;
     while (low < high) {
       byte middle = (low + high) / 2;
       blinkTick();
@@ -925,12 +1089,13 @@ byte probeThreshold(byte i, const byte* uid) {
     result = low;
   }
 
-  setTxPower(i, txStep);   // back to normal power
+  applyReaderSettings(i);   // back to the normal settings of this reader
   return result;
 }
 
 // Chip seen by several readers (mask): the reader with the lowest power
-// step wins. Tie or not seen by anyone -> NO_READER.
+// step wins. Tie -> the tied reader that already shows the chip keeps it,
+// otherwise NO_READER. Not seen by anyone -> NO_READER.
 // Results are remembered for PROBE_CACHE_TIME, unless fresh == true.
 byte decideContested(const byte* uid, byte mask, bool fresh) {
   // Remembered result?
@@ -956,10 +1121,13 @@ byte decideContested(const byte* uid, byte mask, bool fresh) {
   byte best = NO_THRESHOLD;
   byte winner = NO_READER;
   bool tie = false;
+  byte threshold[READER_COUNT];
 
   for (byte i = 0; i < READER_COUNT; i++) {
+    threshold[i] = NO_THRESHOLD;
     if (!(mask & (1 << i))) continue;
     byte t = probeThreshold(i, uid);
+    threshold[i] = t;
 #if DEBUG
     Serial.print(F(" R"));
     Serial.print(i + 1);
@@ -975,14 +1143,29 @@ byte decideContested(const byte* uid, byte mask, bool fresh) {
       tie = true;
     }
   }
-  if (tie) winner = NO_READER;
+  // Tie: the reader that already shows this chip keeps it (at most one
+  // reader can show it), so a tie does not make the chip vanish.
+  // If none of the tied readers shows it: nobody gets it.
+  bool kept = false;
+  if (tie) {
+    winner = NO_READER;
+    for (byte i = 0; i < READER_COUNT; i++) {
+      if (threshold[i] == best && chipPresent[i] &&
+          memcmp(currentUid[i], uid, UID_LENGTH) == 0) {
+        winner = i;
+        kept = true;
+      }
+    }
+  }
+  (void)kept;   // only used for the debug output
 
 #if DEBUG
   if (winner == NO_READER) {
     Serial.println(F(" -> undecided, nobody"));
   } else {
-    Serial.print(F(" -> reader "));
-    Serial.println(winner + 1);
+    Serial.print(kept ? F(" -> tie, reader ") : F(" -> reader "));
+    Serial.print(winner + 1);
+    Serial.println(kept ? F(" keeps it") : F(""));
   }
 #endif
 
@@ -1032,8 +1215,11 @@ byte decideOnReader(byte r, const byte* listRef, const byte* forced,
   byte winner = NO_READER;
   bool tie = false;
 
+  byte threshold[MAX_UIDS];
+
   for (byte f = 0; f < forcedCount; f++) {
     byte t = probeThreshold(r, seenUidAt(listRef[forced[f]]));
+    threshold[f] = t;
 #if DEBUG
     Serial.print(' ');
     if (t == NO_THRESHOLD) Serial.print('-');
@@ -1047,7 +1233,18 @@ byte decideOnReader(byte r, const byte* listRef, const byte* forced,
       tie = true;
     }
   }
-  if (tie) winner = NO_READER;
+
+  // Tie: if the chip the reader already shows is among the tied ones, it
+  // keeps it; otherwise white
+  if (tie) {
+    winner = NO_READER;
+    for (byte f = 0; f < forcedCount; f++) {
+      if (threshold[f] == best && chipPresent[r] &&
+          memcmp(seenUidAt(listRef[forced[f]]), currentUid[r], UID_LENGTH) == 0) {
+        winner = forced[f];
+      }
+    }
+  }
 
 #if DEBUG
   if (winner == NO_READER) {
@@ -1209,7 +1406,7 @@ bool pollReaders(bool fresh) {
       if (chipPresent[i]) removeChip(i);
       continue;
     }
-    seenCount[i] = readAllChips(reader[i], seenUid[i]);
+    seenCount[i] = readReader(i, seenUid[i]);
     blinkTick();   // between the readers so the blinking stays even
   }
 
@@ -1951,7 +2148,12 @@ void setup() {
 #endif
   }
 
-  // Step 2: set gain + transmitter power and switch off the antennas
+  // Step 2: set gain + transmitter power of every reader and switch off
+  // the antennas
+  for (byte i = 0; i < READER_COUNT; i++) {
+    gainStep[i] = RFID_GAIN_STEP[i];
+    txStep[i]   = TX_POWER_STEP[i];
+  }
   applyRfidSettings();
 #if DEBUG
   reportRfidSettings();
@@ -1963,6 +2165,9 @@ void setup() {
     readerColor[i]  = COLOR_WHITE;
     chipPresent[i]  = false;
     failedReads[i]  = 0;
+#if DEBUG
+    fallbackState[i] = FALLBACK_NONE;
+#endif
   }
 
 #if DEBUG
