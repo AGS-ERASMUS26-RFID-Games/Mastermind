@@ -149,7 +149,7 @@ const byte CM_MAX_LENGTH = 20;
 
 // Times in milliseconds
 const unsigned int CM_SHOW_PAUSE          = 300;   // dark pause before the sequence appears
-const unsigned int CM_SHOW_TIME_BASE      = 1000;  // display time of the sequence ...
+const unsigned int CM_SHOW_TIME_BASE      = 2000;  // display time of the sequence ...
 const unsigned int CM_SHOW_TIME_PER_COLOR = 500;   // ... plus this much per color
 
 // ------------------------------- Shared ----------------------------------
@@ -287,9 +287,9 @@ byte colors[COLOR_COUNT][3] =
 {
   {255, 255, 220},  // 0 White
   {255,   0,   0},  // 1 Red
-  {  0, 255,   0},  // 2 Green
+  {  60, 255,  120},  // 2 Green
   {  0,   0, 255},  // 3 Blue
-  {255, 255,   0}   // 4 Yellow
+  {255, 220,   0}   // 4 Yellow
 };
 
 const byte OFF[3] = { 0, 0, 0 };
@@ -1361,10 +1361,11 @@ void mmEvaluate(const byte* attempt, byte &green, byte &yellow) {
   }
 }
 
-// Show the feedback: first green, then yellow, rest off
+// Show the feedback: first green, then yellow, rest red
+// (red = this chip is neither the right color nor at the right position)
 void mmDrawFeedback(byte row, byte green, byte yellow) {
   for (byte i = 0; i < READER_COUNT; i++) {
-    const byte* f = OFF;
+    const byte* f = colors[COLOR_RED];
     if (i < green)               f = colors[COLOR_GREEN];
     else if (i < green + yellow) f = colors[COLOR_YELLOW];
     setLED(row, MM_FEEDBACK_POSITION[i], f);
@@ -1529,13 +1530,19 @@ bool cmInputConfirmable() {
   return !cmWaitForEmpty && cmInputComplete();
 }
 
-// Draws the current input row (takes the blinking into account)
+// Draws the current input row (takes the blinking into account).
+// As long as the chips of the last block have not all been removed
+// (cmWaitForEmpty), the row stays white: the chip colors only appear once
+// all readers of the block were empty and chips are placed again.
 void cmDrawInputRow() {
   bool visible = !cmInputConfirmable() || blinkOn;
 
   for (byte i = 0; i < cmBlockSize(); i++) {
-    cmSetGridLED(cmInputPosition + i,
-                 visible ? colors[readerColor[i]] : OFF);
+    const byte* color;
+    if (cmWaitForEmpty) color = colors[COLOR_WHITE];
+    else if (visible)   color = colors[readerColor[i]];
+    else                color = OFF;
+    cmSetGridLED(cmInputPosition + i, color);
   }
   matrix.show();
 }
@@ -1692,8 +1699,8 @@ void cmConfirmBlock() {
     return;
   }
 
-  // Next row: immediately shows the chips present (not blinking,
-  // since they have to be removed first)
+  // Next row: stays white until all chips were removed and new ones are
+  // placed (see cmDrawInputRow)
   restartBlink();
 }
 

@@ -60,11 +60,13 @@ than once. The player tries to guess this sequence.
 3. **Evaluate:** To the right of the input, the result appears as four LEDs:
    - **Green** = right color in the right position
    - **Yellow** = right color, but in the wrong position
-   - **Off** = no hit for this color
+   - **Red** = no hit for this chip: its color does not appear in the
+     sequence, or all chips of this color in the sequence are already
+     matched by other hits (see the duplicate rule below)
 
    The evaluation is **not position-based**: all green LEDs light up first,
-   then all yellow ones. So the order does *not* reveal which position is
-   correct – exactly like real Mastermind.
+   then all yellow ones, then the red ones. So the order does *not*
+   reveal which position is correct – exactly like real Mastermind.
 4. **Continue:** The next attempt is entered in the row below.
 
 ### Winning and losing
@@ -81,11 +83,11 @@ starts at the press of button 1.
 
 Secret sequence: **Red · Red · Green · Blue**
 
-| Input | Green | Yellow | Explanation |
-|---|---|---|---|
-| Red · Green · Green · Blue | 3 | 0 | Positions 1, 3, 4 match; the second green is one too many |
-| Red · Blue · Blue · Red | 1 | 1 | Position 1 matches (green); another Red exists in the sequence but is misplaced (yellow) |
-| Yellow · Yellow · Yellow · Yellow | 0 | 0 | Yellow does not appear in the sequence at all |
+| Input | Green | Yellow | Red | Explanation |
+|---|---|---|---|---|
+| Red · Green · Green · Blue | 3 | 0 | 1 | Positions 1, 3, 4 match; the second green is one too many |
+| Red · Blue · Blue · Red | 1 | 1 | 2 | Position 1 matches (green); another Red exists in the sequence but is misplaced (yellow) |
+| Yellow · Yellow · Yellow · Yellow | 0 | 0 | 4 | Yellow does not appear in the sequence at all |
 
 Important is the rule for duplicate colors: Each chip of the secret sequence
 can produce only **one** hit. A second Red in the input only turns yellow if
@@ -127,8 +129,11 @@ chips. The sequence gets one color longer with every successful round.
    - The confirmed block stays visible on the grid in its colors.
 4. **Remove the chips:** Before the next block can be confirmed, the chips
    have to be removed from the required readers. As long as chips of the
-   last block are still lying there, the next row shows them but does not
-   blink, and button 1 is ignored. This makes it possible to use the same
+   last block are still lying there, the next row stays **white** (it does
+   not show the chip colors and does not blink), and button 1 is ignored.
+   Only when all required readers were empty does the row show the chips
+   live again. This also applies to the first block of a round: chips still
+   lying there from the previous round are not shown. This makes it possible to use the same
    chips several times in one sequence (e.g. Red – Blue – Red – Red – Red)
    and prevents a double press from confirming the same block twice.
 5. **Evaluate:** Only when the complete sequence has been entered does the
@@ -375,7 +380,7 @@ Row 16                               [ Solution ]   ← only with MM_DEBUG_SHOW_
 ```
 
 - **Input** (columns 3–6): the four readers from left to right.
-- **Feedback** (columns 10–13): green/yellow/off, see section 2.
+- **Feedback** (columns 10–13): green/yellow/red, see section 2.
 - **Row 16** shows the secret sequence when `MM_DEBUG_SHOW_SOLUTION` is
   active.
 
@@ -402,7 +407,8 @@ Row 16
 
 - **Colors** (rows 2, 5, 8, 11, 14): during the display the sequence, then
   white placeholders. During the input the current row shows the chips
-  live; confirmed blocks show the entered colors.
+  live (white until the chips of the previous block were removed);
+  confirmed blocks show the entered colors.
 - **Feedback** (rows 3, 6, 9, 12, 15): green = correct, red = wrong, only
   after the complete sequence has been entered.
 - The arrangement is set in `CM_GRID_POSITION[]`, `CM_INPUT_ROW[]` and
@@ -578,7 +584,8 @@ helpers*, *Mastermind*, *Color Memory Game*, *Screens*, *States*,
   over.
 - `cmSetGridLED(index, color)` / `cmSetFeedbackLED(index, color)` – set the
   LED of a sequence position resp. the feedback below it.
-- `cmDrawInputRow()`, `cmDrawEndImage()` – display.
+- `cmDrawInputRow()`, `cmDrawEndImage()` – display. `cmDrawInputRow()`
+  draws the current row white as long as `cmWaitForEmpty` is set.
 
 **RFID**
 
