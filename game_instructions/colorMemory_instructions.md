@@ -1,73 +1,24 @@
-# Color Memory Game
+# Color Memory
 
-The player has to remember a random color sequence and rebuild it with the
-chips. The sequence gets one color longer with every successful round.
+Memorize a color sequence and rebuild it with your chips. Every round adds one color.
 
-## Course of a round
+## How to play
 
-1. **New sequence:** At the beginning of every round the Arduino generates a
-   **completely new** random sequence of the colors Red, Green, Blue and
-   Yellow. The previous sequence is not extended. Round 1 has 1 color,
-   round 2 has 2 colors, and so on up to `CM_MAX_LENGTH` (20). After that,
-   every round has 20 colors – the game continues endlessly until a mistake
-   is made.
-2. **Display:** After a short dark pause, the **whole sequence is shown at
-   once** on a grid (see section 5). The display time grows with the
-   length: `CM_SHOW_TIME_BASE` + `CM_SHOW_TIME_PER_COLOR` per color
-   (default 1.5 s for 1 color, 11 s for 20 colors). Then every used grid
-   place turns white: the player sees how many colors are needed, but no
-   longer which ones.
-3. **Input in blocks:** Because there are only four readers, the sequence is
-   entered in blocks of four – one block per grid row. Reader 1 to 4
-   correspond to position 1 to 4 of the current row. The last block only
-   needs as many readers as colors are left (e.g. 2 readers for a sequence
-   of 6). The readers that are not needed are **not read at all** and can
-   never get a chip (see "Active readers" in section 4). A chip placed on
-   them is ignored.
-   - The current row shows the chips live, exactly as in Mastermind (no /
-     unknown chip → white).
-   - When a known chip lies on every required reader, the row **blinks** and
-     button 1 confirms the block. With the chip lock active, the readers are
-     checked once more first (see "Chip lock").
-   - The confirmed block stays visible on the grid in its colors.
-4. **Remove the chips:** Before the next block can be confirmed, the chips
-   have to be removed from the required readers. As long as chips of the
-   last block are still lying there, the next row shows them but does not
-   blink, and button 1 is ignored. This makes it possible to use the same
-   chips several times in one sequence (e.g. Red – Blue – Red – Red – Red)
-   and prevents a double press from confirming the same block twice.
-5. **Evaluate:** Only when the complete sequence has been entered does the
-   Arduino compare it with the generated sequence, **position by
-   position**. Directly below every color an LED appears:
-   - **Green** = correct color at this position → **1 point**
-   - **Red** = wrong color at this position
-6. **Continue:** If every position is correct, the next round starts with a
-   new sequence that is one color longer. If at least one position is
-   wrong, the game is over.
+1. **Watch:** A new random sequence of Red, Green, Blue and Yellow is shown on the grid. Round 1 has 1 color, round 2 has 2, and so on (max. 20). The sequence is completely new each round, not an extension of the last one. The longer it is, the longer it stays visible. Then all used places turn white, so you see how many colors you need but no longer which ones.
+2. **Enter in blocks of four:** Each grid row is one block. Readers 1–4 match positions 1–4 of the current row. In the last block, only as many readers as colors remain are active. Chips on the other readers are ignored.
+3. **Confirm the block:** When every required reader has a known chip, the row blinks. Press **button 1** to confirm. The block stays visible in its colors.
+4. **Clear the readers:** Remove your chips before entering the next block. Until then, button 1 is ignored. This lets you reuse the same chips within one sequence and prevents accidental double confirmations.
+5. **Get your result:** After the last block, every position is compared to the sequence:
+   - 🟢 **Green** = correct (+1 point)
+   - 🔴 **Red** = wrong
 
-## Evaluation – an example
-
-Generated sequence: **Red · Blue · Yellow · Green**
-
-| Position | Sequence | Input | Result |
-|---|---|---|---|
-| 1 | Red | Red | Green LED, +1 point |
-| 2 | Blue | Blue | Green LED, +1 point |
-| 3 | Yellow | Green | Red LED |
-| 4 | Green | Green | Green LED, +1 point |
-
-Position 3 is wrong, so the game ends after this evaluation.
+   If everything is green, the next round starts. If at least one position is wrong, the game is over.
 
 ## Scoring
 
-The score is the number of correct positions **over all rounds of a game**.
-Correct positions of the last, failed round count as well.
-
-Example: rounds 1 to 3 without a mistake, then 2 of 4 positions correct in
-round 4 → score = 1 + 2 + 3 + 2 = **8**.
+You score 1 point per correct position across **all rounds**, including the failed last round.
+Example: rounds 1–3 perfect, then 2 of 4 correct in round 4 → 1 + 2 + 3 + 2 = **8 points**.
 
 ## Game over
 
-The end screen alternates between the scrolling text “GAME OVER” in red and
-the score as a green number (section 5). Button 1 starts a new game in
-round 1 with score 0; button 2 or 3 switches the game.
+The screen alternates between "GAME OVER" and your score. **Button 1** starts a new game. **Button 2 or 3** switches the game.

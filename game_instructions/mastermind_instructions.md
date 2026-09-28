@@ -1,49 +1,24 @@
-# 1. Mastermind
+# Mastermind
 
-At the start of a game, the Arduino rolls a secret sequence of four colors.
-The choices are **Red, Green, Blue and Yellow**; each color may appear more
-than once. The player tries to guess this sequence.
+The Arduino picks a secret sequence of four colors: **Red, Green, Blue, Yellow**. Colors can repeat. Find the sequence!
 
-## Course of a round
+## How to play
 
-1. **Input:** A color chip is placed on each of the four readers. The
-   corresponding LED in the current row shows the color of the chip. If no
-   chip (or an unknown chip) is present, the LED lights up white.
-2. **Confirm:** As soon as a known chip lies on all four readers, the row
-   **blinks**. Pressing button 1 confirms the input. With the chip lock
-   active, all readers are checked once more first; if the result differs
-   from the display, the press is ignored and the corrected row is shown
-   (see "Chip lock").
-3. **Evaluate:** To the right of the input, the result appears as four LEDs:
-   - **Green** = right color in the right position
-   - **Yellow** = right color, but in the wrong position
-   - **Off** = no hit for this color
+1. **Place chips:** Put a chip on each of the four readers. The current row shows their colors (white = no or unknown chip).
+2. **Confirm:** When all four chips are recognized, the row blinks. Press **button 1** to confirm.
+3. **Read the result:** Four LEDs to the right show how close you are:
+   - 🟢 **Green** = right color, right position
+   - 🟡 **Yellow** = right color, wrong position
+   - ⚫ **Off** = no hit
 
-   The evaluation is **not position-based**: all green LEDs light up first,
-   then all yellow ones. So the order does *not* reveal which position is
-   correct – exactly like real Mastermind.
-4. **Continue:** The next attempt is entered in the row below.
+   The LEDs are sorted (green first, then yellow), so their order does *not* tell you which position was right.
+4. **Try again:** Your next guess goes into the next row.
 
-## Winning and losing
+Every chip in the secret sequence counts only once. With the secret **Red · Red · Green · Blue**, the guess **Red · Green · Green · Blue** gives 3 green and 0 yellow, because the second Green has no match left.
 
-- **Won:** All four evaluation LEDs are green (color *and* position correct
-  everywhere).
-- **Lost:** The maximum number of attempts (`MM_MAX_ATTEMPTS`) is reached
-  without the sequence being guessed.
+## Win or lose
 
-In both cases a final screen appears (see section 5), after which a new game
-starts at the press of button 1.
+- **Win:** All four result LEDs are green.
+- **Lose:** You run out of attempts.
 
-## Evaluation – an example
-
-Secret sequence: **Red · Red · Green · Blue**
-
-| Input | Green | Yellow | Explanation |
-|---|---|---|---|
-| Red · Green · Green · Blue | 3 | 0 | Positions 1, 3, 4 match; the second green is one too many |
-| Red · Blue · Blue · Red | 1 | 1 | Position 1 matches (green); another Red exists in the sequence but is misplaced (yellow) |
-| Yellow · Yellow · Yellow · Yellow | 0 | 0 | Yellow does not appear in the sequence at all |
-
-Important is the rule for duplicate colors: Each chip of the secret sequence
-can produce only **one** hit. A second Red in the input only turns yellow if
-the secret sequence also contains a second (not yet matched) Red.
+Button 1 starts a new game.
